@@ -25,6 +25,13 @@ Incidents that ship with the template (general, not instance-specific):
   run first), so 6443, 10250 and the unauthenticated flannel VXLAN port stay
   open to the internet while `ufw status` looks correct. Why the bootstrap
   installs an nftables guard instead.
+- `zitadel-default-admin.md` — omitting `FirstInstance.Org.Human` (to keep a
+  plaintext password out of git) did not prevent a human admin; it produced
+  ZITADEL's **default** one: `zitadel-admin@zitadel.<domain>` / `Password1!`,
+  IAM_OWNER, active, public. Nobody knew it existed, so nobody changed it —
+  and revoking `iam-admin` left it as the only route to instance level. Why
+  invariant 9 demands an account **inventory**, and why the bootstrap now
+  changes that password and proves it with a failed login.
 
 The feedback loop: if an incident's lesson generalizes beyond this
 instance, lift the generalizable part into the template

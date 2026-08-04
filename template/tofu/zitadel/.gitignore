@@ -6,5 +6,5 @@
 
 # Service-user key for the ZITADEL provider — NEVER commit.
 # The glob also covers service-user.json.pem, the extracted signing key used by
-# the revocation negative test (runbooks/bootstrap-from-zero.md §5.3).
+# the revocation negative test (runbooks/bootstrap-from-zero.md §5.4).
 service-user.json*

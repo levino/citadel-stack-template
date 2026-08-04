@@ -71,7 +71,16 @@ Synced/Healthy). Fully scriptable, no console step:
    jq -re '.userId, .keyId' service-user.json   # verify: both non-empty
    ```
 
-3. Apply the bootstrap:
+3. **Inventory the instance administrators and remove the vendor default —
+   before anything else.** The ZITADEL setup job also creates a *human*
+   `IAM_OWNER` you never configured: `zitadel-admin@zitadel.<domain>` with the
+   documented default password `Password1!` (omitting `FirstInstance.Org.Human`
+   yields the vendor's default, not "no user"). List the instance members,
+   change that password immediately, and prove it with a **failed** login using
+   the old value: `runbooks/bootstrap-from-zero.md` §5.2,
+   `runbooks/incidents/zitadel-default-admin.md`, `AGENTS.md` invariant 9.
+
+4. Apply the bootstrap:
 
    ```bash
    tofu init
@@ -85,13 +94,30 @@ Synced/Healthy). Fully scriptable, no console step:
    tofu output -raw admin_initial_password
    ```
 
-4. **Revoke the credential — mandatory, and in this order:** revoke the key
-   and deactivate the machine user via the API, then **prove the revocation
-   worked while you still hold the key** (request a token with the JWT profile
-   again — it must fail), and only then destroy the key material (file +
-   `zitadel/iam-admin` secret). Full commands, including the
-   `urn:ietf:params:oauth:grant-type:jwt-bearer` negative test:
-   `runbooks/bootstrap-from-zero.md` §5.3.
+5. **Give a human account instance rights — before step 6.** The user created
+   here is an **`ORG_OWNER`**, which is *not* an instance administrator: it
+   gets `403` on `/admin/v1/*`, so no SMTP provider, no instance login/password
+   policy, no instance-wide external IdP, no further orgs, no further instance
+   admins. Grant it `IAM_OWNER` at instance level while the bootstrap
+   credential still works:
+
+   ```bash
+   curl -fsS -X POST "https://id.<domain>/admin/v1/members" \
+     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d "$(jq -n --arg u "$(tofu output -raw admin_user_id)" \
+           '{userId:$u,roles:["IAM_OWNER"]}')"
+   ```
+
+6. **Revoke the credential — mandatory, and in this order:** first confirm that
+   a **human** `IAM_OWNER` exists whose (non-default) password you actually
+   hold and have just tested — revoking before that cuts the instance level off
+   entirely, and you only find out weeks later. Then revoke the key and
+   deactivate the machine user via the API, **prove the revocation worked while
+   you still hold the key** (request a token with the JWT profile again — it
+   must fail), and only then destroy the key material (file +
+   `zitadel/iam-admin` secret). Full commands, including the precondition gate
+   and the `urn:ietf:params:oauth:grant-type:jwt-bearer` negative test:
+   `runbooks/bootstrap-from-zero.md` §5.4.
 
    Do not shorten this to "delete the file and the secret". The API answering
    HTTP 200 twice is not evidence that the credential is dead, and once the
@@ -124,7 +150,9 @@ Managed (bootstrap only):
 
 - the org = the community (the shared identity pool)
 - the first admin user as `ORG_OWNER` (`admin.tf`) — the human who then takes
-  over via the console
+  over via the console. **`ORG_OWNER` is org level only**; the instance-level
+  `IAM_OWNER` grant is a deliberate API step (step 5 above), because a member
+  role is identity *content* and does not belong in tofu state (invariant 6).
 
 **Not** managed here (API/console at runtime — invariant 6):
 

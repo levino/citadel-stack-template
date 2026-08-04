@@ -28,6 +28,11 @@ resource "zitadel_org_member" "admin_owner" {
   roles   = ["ORG_OWNER"]
 }
 
+output "admin_user_id" {
+  value       = zitadel_human_user.admin.id
+  description = "User ID of the first human. Needed to grant this account IAM_OWNER at instance level before the bootstrap credential is revoked — ORG_OWNER alone cannot reach /admin/v1/* (runbooks/bootstrap-from-zero.md §5.4.0)."
+}
+
 output "admin_initial_password" {
   value       = random_password.admin_initial.result
   description = "Initial password for the admin user — must be changed on first login. Read once with `tofu output -raw admin_initial_password`."
