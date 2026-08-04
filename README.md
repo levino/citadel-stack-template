@@ -313,7 +313,11 @@ These apply to every instance and every agent that touches the stack:
   discipline.
 - **GitOps is the single source of truth.** No manual `kubectl apply` outside
   documented bootstrap steps.
-- **Secrets only as sealed-secrets in git.** Never commit plaintext secrets.
+- **Two classes of secret, two homes.** *App* secrets enter git as
+  sealed-secrets; *infrastructure* credentials (Argo CD's git auth, the ZITADEL
+  operator credential, the registry pull credential for private images) live
+  only in the cluster — never committed, not even sealed. Never commit
+  plaintext.
 - **Build multi-arch** when the target node is ARM64.
 - **ZITADEL = IdP, not CRM.** Domain data belongs in app databases.
 - **Identity is declarative** (OpenTofu), not UI clicks.

@@ -12,6 +12,7 @@ Read this file first. For any non-trivial operation there is a runbook:
 - Build everything from scratch: `runbooks/bootstrap-from-zero.md`
 - Known footguns (read BEFORE debugging): `runbooks/incidents/`
 - Argo CD git auth (GitHub App, per-org credential): `runbooks/argocd-github-app.md`
+- Private container images (registry pull credential): `runbooks/bootstrap-from-zero.md` §7
 - PR previews (ApplicationSet PullRequest generator): `patterns/app-preview-prs/`
 - ZITADEL bootstrap secrets: `zitadel/SECRETS.md`
 - ZITADEL identity content (API, not git): `runbooks/zitadel-identity-via-api.md`
@@ -37,11 +38,15 @@ Read this file first. For any non-trivial operation there is a runbook:
      an app and rotate with it. These — and ONLY these — enter the repo as
      **SealedSecrets**: seal offline against `sealed-secrets-public-key.pem`,
      commit the sealed blob next to the app.
-   - **Infrastructure credentials** (above all the Argo CD git-auth GitHub App
-     key — see inv. 4 — and any ZITADEL operator credential — see inv. 6)
+   - **Infrastructure credentials** belong to the *cluster*, not to any app:
+     the Argo CD git-auth GitHub App key (inv. 4), any ZITADEL operator
+     credential (inv. 6), and the **registry pull credential** that lets a
+     namespace pull a private image (`imagePullSecret`, bootstrap §7). They
      live **ONLY in the cluster**, created directly with `kubectl` — **NEVER
      in git, not even sealed.** A sealed infra credential leaves a permanent
      encrypted blob in history forever and is not what SealedSecrets are for.
+     The test is not "is it a secret" but **whom it authenticates**: an app
+     (→ sealed, in git) or the cluster/operator itself (→ `kubectl` only).
      Accepted trade-off (documented, not a bug): these secrets are **not**
      reproducible from git and must be **recreated by hand at cluster
      rebuild** — the bootstrap and `runbooks/argocd-github-app.md` cover how.
@@ -60,6 +65,15 @@ Read this file first. For any non-trivial operation there is a runbook:
    are infrastructure credentials: created directly in the cluster, never
    committed (inv. 3). PUBLIC repos need no credential at all. Full recipe:
    `runbooks/argocd-github-app.md`.
+   **Scope of this rule: Argo CD's git authentication.** It is not a blanket
+   ban on tokens. **Pulling private container images is a different problem
+   with a different answer**: GHCR accepts neither App installation tokens nor
+   fine-grained PATs, and a one-hour token cannot back a static
+   `imagePullSecret`. There the prescribed credential is a **classic PAT whose
+   only scope is `read:packages`**, installed as the `imagePullSecret`
+   `ghcr-pull` in the app namespace — also an infrastructure credential
+   (inv. 3), with `owner` / `expires` annotations and a renewal duty. Recipe,
+   verify and the two "why not" arguments: `runbooks/bootstrap-from-zero.md` §7.
 5. **Images must run on {{ target_arch }} — built on NATIVE runners, never
    QEMU.** Build each architecture on its own native GitHub runner
    (`ubuntu-24.04-arm` for arm64, `ubuntu-latest` for amd64) and merge them
@@ -105,6 +119,12 @@ kubectl get pods -A | grep -v Running | grep -v Completed   # should be empty
 kubectl get certificates -A      # all Ready=True
 curl -fsS https://id.{{ domain }}/.well-known/openid-configuration | head -3
 kubectl describe node | grep -A5 Conditions   # no DiskPressure (see incidents/)
+
+# Registry pull credentials: every row needs an owner and a future date
+# (bootstrap §7). An expired one fails silently — only restarting Pods notice.
+kubectl get secret -A --field-selector type=kubernetes.io/dockerconfigjson \
+  -o custom-columns=NS:.metadata.namespace,SECRET:.metadata.name,\
+OWNER:.metadata.annotations.owner,EXPIRES:.metadata.annotations.expires
 ```
 
 (With the Argo CD CLI logged in, `argocd app list` shows the same.)

@@ -148,6 +148,9 @@ spec:
 
   echo "Next: commit & push. If the app needs login, see patterns/app-native-oidc/."
   echo "PR previews: see patterns/app-preview-prs/ for the overlay the app repo must carry."
+  echo "Private image (any app that bakes protected content into its build):"
+  echo "  install the ghcr-pull imagePullSecret in namespace ${NAME} —"
+  echo "  runbooks/bootstrap-from-zero.md §7. Never make the package public."
   exit 0
 fi
 

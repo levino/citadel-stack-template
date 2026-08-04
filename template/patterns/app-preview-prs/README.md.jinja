@@ -30,6 +30,13 @@ Keep previews cheap: one replica, `revisionHistoryLimit: 2`,
 `progressDeadlineSeconds: 300` (same discipline `new-app.sh` bakes into in-repo
 apps — disk-pressure prevention).
 
+**Private image?** A preview namespace is created by Argo CD the moment the PR
+opens, so a hand-made `imagePullSecret` can never be in it in time. For an app
+with previews and a private package the pull credential goes on the node
+instead — `runbooks/bootstrap-from-zero.md` §7.6. Do not make the package
+public to get previews working: the image contains the site's content
+(`patterns/app-deploy-ci/`, "The package stays private").
+
 ## 2. Register the ApplicationSet
 
 `scripts/new-app.sh <app> --repo https://github.com/{{ github_owner }}/<app>`
