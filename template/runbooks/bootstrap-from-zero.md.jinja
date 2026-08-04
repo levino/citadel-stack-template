@@ -41,7 +41,9 @@ for t in git curl unzip gpg jq; do
 done   # prints nothing when all of them are present
 ```
 
-## 1. Install k3s
+## 1. Install k3s and close the host
+
+### 1.1 Install k3s
 
 On the server, as root:
 
@@ -68,8 +70,129 @@ kubectl get node   # one node, STATUS Ready
 ```
 
 To operate remotely, add a `tls-san` for your API domain in
-`/etc/rancher/k3s/config.yaml` and open 6443 (see §7); for a first
-bootstrap, running directly on the server is fine.
+`/etc/rancher/k3s/config.yaml` and open 6443 in the §1.2 guard (see §7); for a
+first bootstrap, running directly on the server is fine.
+
+### 1.2 Host firewall
+
+Do this **now**, not later: between the k3s install and this step, the cluster
+API is on the public internet.
+
+k3s opens these on all interfaces, without asking:
+
+| Port | Service |
+|---|---|
+| 6443/tcp | kube-apiserver |
+| 10250/tcp | kubelet API |
+| 10248, 10249, 10256–10259/tcp | component ports (bound to 127.0.0.1, listed for completeness) |
+| 8472/udp | flannel VXLAN — **unauthenticated** |
+
+VXLAN is the serious one: whoever can send UDP 8472 to the node injects packets
+straight into the pod network, bypassing Traefik, ForwardAuth and ZITADEL
+entirely.
+
+**`ufw` does not close these — and it looks like it does, which is worse.** k3s
+inserts its chains ahead of ufw's and accepts marked traffic before ufw is ever
+reached. The INPUT chain after `ufw enable`:
+
+```
+-P INPUT DROP
+-A INPUT ... -j KUBE-ROUTER-INPUT
+-A INPUT ... -j KUBE-PROXY-FIREWALL
+-A INPUT ... -j KUBE-NODEPORTS
+-A INPUT ... -j KUBE-EXTERNAL-SERVICES
+-A INPUT -j KUBE-FIREWALL
+-A INPUT ... -m mark --mark 0x20000/0x20000 -j ACCEPT   <-- accepted here already
+-A INPUT -j ufw-before-input                            <-- ufw only runs here
+```
+
+With `ufw default deny incoming` set and `ufw status` looking correct, 6443 and
+10250 stay reachable from the internet — measured from an external host, not
+read off the ruleset. Inserting plain iptables rules is no answer either: k3s
+rewrites its chains regularly and they disappear.
+
+**What works** is an own nftables table hooked *before* the filter table. It
+runs ahead of the k3s chains and survives k3s rewriting its own rules:
+
+```bash
+sudo apt-get install -y nftables
+sudo mkdir -p /etc/nftables.d
+sudo tee /etc/nftables.d/k3sguard.nft >/dev/null <<'EOF'
+#!/usr/sbin/nft -f
+# Deliberately NO `flush ruleset` here — that would also wipe k3s's own
+# iptables-nft chains until it resyncs. Recreate only our own table.
+table inet k3sguard
+delete table inet k3sguard
+
+table inet k3sguard {
+    chain input {
+        type filter hook input priority -150; policy accept;
+        iif lo accept
+        ct state established,related accept
+        ip saddr { 127.0.0.0/8, 10.42.0.0/16, 10.43.0.0/16, {{ server_ipv4 }} } accept
+        iifname { "cni0", "flannel.1" } accept
+        # Operating kubectl from your laptop instead of the server? Add an
+        # accept for your admin IP ABOVE the drop, e.g.
+        #   ip saddr <your-admin-ip> tcp dport 6443 accept
+        # For the optional CI-OIDC case, open 6443 as described in §7.
+        tcp dport { 6443, 10248, 10249, 10250, 10256, 10257, 10258, 10259 } drop
+        udp dport 8472 drop
+    }
+}
+EOF
+grep -q 'nftables.d' /etc/nftables.conf \
+  || echo 'include "/etc/nftables.d/*.nft"' | sudo tee -a /etc/nftables.conf
+sudo systemctl enable --now nftables
+sudo nft -f /etc/nftables.conf
+```
+
+Re-running the file is safe: the `table` / `delete table` / `table { … }` idiom
+recreates only our own table, so rules never accumulate. `nft list ruleset`
+prints the priority as `mangle` (= -150) and may collapse the two CIDRs into
+`10.42.0.0/15` — both are display forms of what you wrote, not a modification.
+
+`policy accept` plus an explicit drop list is deliberate: this table closes the
+k3s ports and nothing else, so 22/80/443 stay open and it cannot lock you out
+of SSH. It is a guard, not a general firewall. `10.42.0.0/16` and
+`10.43.0.0/16` are k3s's default pod and service CIDRs; the node's own address
+must stay in the accept set, or the apiserver can no longer reach the kubelet
+and `kubectl logs`/`exec` break.
+
+If you want ufw on top (cosmetic here — the nft table does the work), set
+`DEFAULT_FORWARD_POLICY="ACCEPT"` in `/etc/default/ufw` first, otherwise the
+pod network breaks.
+
+**Verify — from an external host. Testing from the server proves nothing:**
+
+```bash
+# On a DIFFERENT machine, out on the public internet:
+nc -vz -w3 {{ server_ipv4 }} 443     # succeeds
+nc -vz -w3 {{ server_ipv4 }} 6443    # must time out
+nc -vz -w3 {{ server_ipv4 }} 10250   # must time out
+sudo nmap -Pn -sU -p 8472 {{ server_ipv4 }}   # must not be open
+```
+
+Two traps here look like results and are not:
+
+- **Behind an egress proxy, every port reports open.** If the machine you scan
+  from routes through a proxy (corporate network, CI runner, sandboxed
+  container with `HTTP(S)_PROXY` set), the proxy accepts the TCP connection
+  locally and every port comes back open. Self-check first:
+  `nc -vz -w3 {{ server_ipv4 }} 6444` — nothing listens there, so if *that*
+  reads open you are measuring the proxy, not the server. Use a real external
+  host.
+- **A failing `kubectl exec` is not automatically a firewall problem.** Later
+  in the bootstrap, `kubectl exec` into ZITADEL fails because its distroless
+  image has no `sh`/`echo` — the error reads like a broken apiserver→kubelet
+  path but is only the image. Test that path with busybox instead.
+
+**Verify the cluster still works from the server:**
+
+```bash
+kubectl get node        # still Ready
+kubectl run fwcheck --rm -it --restart=Never --image=busybox:1.36 -- echo ok
+# ^ exercises the apiserver → kubelet path the node-IP accept rule keeps open
+```
 
 ## 2. Install Argo CD
 
@@ -407,13 +530,36 @@ tls-san:
 
 ```bash
 sudo systemctl restart k3s
-sudo ufw allow 6443/tcp comment 'k3s API for GitHub Actions OIDC'
-sudo ufw reload
 ```
 
-Source `Anywhere` is acceptable: GitHub's runner IPs rotate and the API
-enforces OIDC auth — unauthenticated requests get 401. If this rule is
-missing, CI deploys fail with `dial tcp {{ server_ipv4 }}:6443: i/o timeout`.
+Then open 6443 — **in the §1.2 nft guard, which is what actually filters on
+this node.** `ufw allow 6443/tcp` does nothing here (§1.2): k3s's chains run
+before ufw's, so the port was never closed by ufw in the first place and the
+rule only creates the impression of a deliberate exception. Edit
+`/etc/nftables.d/k3sguard.nft` and accept 6443 *above* the drop rule:
+
+```nft
+        tcp dport 6443 accept
+        tcp dport { 10248, 10249, 10250, 10256, 10257, 10258, 10259 } drop
+```
+
+```bash
+sudo nft -f /etc/nftables.conf
+```
+
+**Verify from an external host** (see the two traps in §1.2 — a proxied scan
+reports everything open):
+
+```bash
+nc -vz -w3 {{ server_ipv4 }} 6443    # now open
+nc -vz -w3 {{ server_ipv4 }} 10250   # still closed — only 6443 was punched
+```
+
+Source `Anywhere` is acceptable for 6443: GitHub's runner IPs rotate and the
+API enforces OIDC auth — unauthenticated requests get 401. It is acceptable
+for **6443 only**; 10250 and 8472 stay closed, they have no such
+authentication in front of them. If the hole is missing, CI deploys fail with
+`dial tcp {{ server_ipv4 }}:6443: i/o timeout`.
 
 CI identities authenticate as
 `https://token.actions.githubusercontent.com#repo:<owner>/<repo>:<ref>`. Bind

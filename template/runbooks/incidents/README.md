@@ -21,6 +21,10 @@ Incidents that ship with the template (general, not instance-specific):
 - `argocd-version-skew.md` — an Argo CD older than the cluster's Kubernetes
   version cannot diff and silently stops reconciling, while still reporting
   `Healthy`. Why the bootstrap runbook no longer pins an old release.
+- `k3s-host-firewall.md` — `ufw` filters nothing on a k3s node (k3s's chains
+  run first), so 6443, 10250 and the unauthenticated flannel VXLAN port stay
+  open to the internet while `ufw status` looks correct. Why the bootstrap
+  installs an nftables guard instead.
 
 The feedback loop: if an incident's lesson generalizes beyond this
 instance, lift the generalizable part into the template
