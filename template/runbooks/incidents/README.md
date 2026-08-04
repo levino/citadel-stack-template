@@ -18,6 +18,9 @@ Incidents that ship with the template (general, not instance-specific):
   single-node stack: label tracking prunes ZITADEL's runtime `login-client`
   secret, and the Ingress health check hangs forever without a LoadBalancer.
   Both fixed by one `argocd-cm` patch at bootstrap.
+- `argocd-version-skew.md` — an Argo CD older than the cluster's Kubernetes
+  version cannot diff and silently stops reconciling, while still reporting
+  `Healthy`. Why the bootstrap runbook no longer pins an old release.
 
 The feedback loop: if an incident's lesson generalizes beyond this
 instance, lift the generalizable part into the template

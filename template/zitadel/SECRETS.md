@@ -15,13 +15,17 @@ personal data, so versioning them sealed is correct.
 
 ## What does NOT belong here (anti-patterns)
 
-- **No ZITADEL API credential.** The credential the operator uses to manage
-  identity content (PAT, or a service-account key) is an **infrastructure
-  credential**: held by the operator and passed per session, **never stored in
-  the cluster and never committed** (invariants 3 + 6). The old bootstrap that
-  parked an `iam-admin` service-account key/PAT as a k8s secret in the
-  `zitadel` namespace is an **anti-pattern** — do not reintroduce it. See
-  `tofu/zitadel/README.md` and `runbooks/zitadel-identity-via-api.md`.
+- **No ZITADEL API credential in git.** The credential used to manage identity
+  content (a PAT, or a service-account key) is an **infrastructure
+  credential**: passed per session, **never committed — not plaintext, not
+  sealed** (invariants 3 + 6). Never seal an API credential into this
+  directory.
+  The `zitadel/iam-admin` secret that ZITADEL's setup job creates is **not**
+  managed here and is not in git: the bootstrap reads it once for the tofu
+  apply and then **deletes it** (`tofu/zitadel/README.md` step 4). Using it
+  once is fine; leaving it in the cluster as a **standing** IAM-owner
+  credential is the anti-pattern. See also
+  `runbooks/zitadel-identity-via-api.md`.
 - **No identity content.** Projects, roles, OIDC clients and — above all —
   user/group membership are managed at runtime via the ZITADEL API, never as
   sealed secrets or tofu state (GDPR; invariant 6).

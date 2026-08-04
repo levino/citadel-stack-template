@@ -31,9 +31,10 @@ zreq() { curl -fsS -H "Authorization: Bearer $ZITADEL_TOKEN" \
   -H 'Content-Type: application/json' "$ZITADEL_HOST$@"; }
 ```
 
-> **Anti-pattern (do not):** extracting the chart's `iam-admin` key and
-> parking it on disk or as a k8s secret as a standing admin credential. Mint a
-> scoped PAT, use it, discard it.
+> **Anti-pattern (do not):** *keeping* the chart's `iam-admin` key on disk or
+> as a k8s secret as a standing admin credential. The bootstrap uses that key
+> exactly once and revokes it (`runbooks/bootstrap-from-zero.md` §5.3); for
+> day-to-day identity work it is gone — mint a scoped PAT, use it, discard it.
 
 ## Common operations
 

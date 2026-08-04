@@ -76,8 +76,10 @@ spec:
                     Mode: disable
                   # Password via env ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD
             # The setup job creates the machine user `iam-admin` (chart default)
-            # and stores its JWT profile as k8s secret zitadel/iam-admin — that
-            # is the credential OpenTofu uses (tofu/zitadel/README.md).
+            # and stores its JWT profile as k8s secret zitadel/iam-admin — the
+            # ONE-SHOT bootstrap credential for OpenTofu, deleted and revoked
+            # right after the apply (tofu/zitadel/README.md step 4). It must
+            # never stay in the cluster as a standing credential.
 
         replicaCount: 1
 

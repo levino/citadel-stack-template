@@ -21,33 +21,38 @@ instance and org up so a human admin can log in and take over via the console
 and the API. Everything after that is API/console work, documented as
 runbooks, not committed as state.
 
-## The API credential — operator-held, never in the cluster
+## The API credential — used once, never standing
 
-The credential used to drive the ZITADEL API is a **service-user PAT held by
-the operator** and passed **per session** (e.g. exported into the shell for
-one `tofu apply` or one batch of API calls). It is an **infrastructure
-credential** (invariants 3 + 6):
+The provider credential is an **infrastructure credential** (invariants 3 + 6):
 
-- **never** stored in the cluster — no service-account key, no PAT as a k8s
-  secret;
-- **never** committed — not plaintext, not sealed.
+- **never** committed — not plaintext, not sealed;
+- **never** left in the cluster or on disk as a **standing** credential.
 
-> **Anti-pattern (removed):** earlier versions extracted the chart's
-> `iam-admin` service-account key from a k8s secret and parked it on disk /
-> in the cluster as the standing provider credential. Do **not** do this.
-> Mint a scoped service-user PAT, use it for the session, discard it.
+What the invariant governs is **persistence, not usage**. ZITADEL's setup job
+creates the machine user `iam-admin` and stores its JWT profile as the k8s
+secret `zitadel/iam-admin`; the provider authenticates with `jwt_profile_file`
+(`main.tf`). Reading that secret **once** for the bootstrap apply and revoking
+it immediately afterwards is the documented path — it satisfies the invariant
+more strictly than a hand-minted PAT, which typically stays valid until someone
+remembers to delete it.
 
-Trade-off, accepted and documented: the API credential is not reproducible
-from git. At cluster rebuild you mint a fresh operator PAT by hand (see the
-runbook). That is the correct cost of keeping personal data and standing
-admin credentials out of the repo.
+> **Anti-pattern (do not):** *parking* the `iam-admin` key on disk or in the
+> cluster as the permanent provider credential — a standing IAM-owner key that
+> outlives the bootstrap. Revocation (step 4 below) is part of the procedure,
+> not an optional tidy-up.
+
+This also removes the last human step from a bootstrap: the whole stack comes
+up without anyone logging into a console, which is the point of this template.
+
+Trade-off, accepted and documented: after revocation the API credential is not
+reproducible from git. A later `tofu apply` needs a fresh credential — a new
+`iam-admin` key from a re-run setup job, or an operator PAT minted by hand.
+That is the correct cost of keeping standing admin credentials out of the repo.
 
 ## Bootstrap (once, after the first ZITADEL deploy)
 
 ZITADEL must be running (`kubectl -n argocd get app zitadel` →
-Synced/Healthy). Mint an operator service-user PAT in the ZITADEL console
-(Instance → Service Users → create → generate **Personal Access Token**, give
-it IAM-owner manager role), then provide it to the provider **per session**:
+Synced/Healthy). Fully scriptable, no console step:
 
 1. Create the state namespace (once):
 
@@ -55,11 +60,15 @@ it IAM-owner manager role), then provide it to the provider **per session**:
    kubectl create namespace terraform-state
    ```
 
-2. Export the operator PAT for this session only (never written to git, never
-   stored in the cluster):
+2. Take the credential out for this session (gitignored, mode 600 — never
+   committed, never copied elsewhere):
 
    ```bash
-   export ZITADEL_TOKEN="<operator-service-user-PAT>"
+   umask 077
+   kubectl -n zitadel get secret iam-admin \
+     -o jsonpath='{.data.iam-admin\.json}' | base64 -d > service-user.json
+   chmod 600 service-user.json
+   jq -re '.userId, .keyId' service-user.json   # verify: both non-empty
    ```
 
 3. Apply the bootstrap:
@@ -75,6 +84,28 @@ it IAM-owner manager role), then provide it to the provider **per session**:
    ```bash
    tofu output -raw admin_initial_password
    ```
+
+4. **Revoke the credential — mandatory, verified:**
+
+   ```bash
+   shred -u service-user.json 2>/dev/null || rm -f service-user.json
+   kubectl -n zitadel delete secret iam-admin
+   test ! -e service-user.json && echo "local credential gone"
+   kubectl -n zitadel get secret iam-admin   # → NotFound
+   ```
+
+   Then invalidate the key itself in ZITADEL (console → Instance → Users →
+   Service Users → `iam-admin` → Keys → delete, or deactivate the user), so
+   the copy that was on disk cannot be replayed. A later chart upgrade re-runs
+   the setup job and may recreate `zitadel/iam-admin` — check after every
+   ZITADEL upgrade and delete it again.
+
+**Alternative (rebuild case):** if the secret no longer exists and no setup job
+will recreate it, mint an operator service-user PAT by hand instead — console →
+Instance → Service Users → create → IAM-owner manager role → generate a
+**Personal Access Token** — and pass it per session via `ZITADEL_TOKEN`
+(the provider accepts it in place of `jwt_profile_file`), then delete the PAT
+in the console when done. Same rule: used per session, never stored.
 
 From here, log in at `https://id.{{ domain }}` as `admin` and do all further
 identity work through the console / API (`runbooks/zitadel-identity-via-api.md`).

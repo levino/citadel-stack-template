@@ -9,10 +9,13 @@ Total time: ~30–45 minutes, most of it waiting for ZITADEL's first start.
 
 ## 0. Prerequisites
 
-- A server (Ubuntu, {{ target_arch }}) reachable at `{{ server_ipv4 }}`,
+- A server (Ubuntu or Debian, {{ target_arch }}) reachable at `{{ server_ipv4 }}`,
   root access, ports 80/443 free (no other web server running).
 - DNS: `*.{{ domain }}` (wildcard A record) → `{{ server_ipv4 }}`.
 - This repo pushed to `https://github.com/{{ github_owner }}/{{ project_name }}`.
+- **On the server: `curl` and `git`.** A minimal Debian/Ubuntu install ships
+  neither, and §3–§4 clone this repo on the server and push the sealed secrets
+  back from it: `sudo apt-get update && sudo apt-get install -y curl git`.
 - Locally (or on the agent's machine): `kubectl`, `kubeseal`, `tofu`, `git`
   (the `argocd` CLI is handy but optional — everything works via `kubectl`).
 
@@ -21,6 +24,12 @@ Total time: ~30–45 minutes, most of it waiting for ZITADEL's first start.
 ```bash
 dig +short id.{{ domain }} anything.{{ domain }}
 # both → {{ server_ipv4 }}
+```
+
+**Verify the server's tooling:**
+
+```bash
+curl --version | head -1 && git --version   # both must print a version
 ```
 
 ## 1. Install k3s
@@ -55,10 +64,23 @@ bootstrap, running directly on the server is fine.
 
 ## 2. Install Argo CD
 
+Argo CD is the one component installed imperatively — everything after it comes
+from git. **Do not pin an old release.** An Argo CD older than the cluster's
+Kubernetes version cannot build a typed diff against newer built-in schemas and
+stops reconciling *while still reporting Healthy*
+(`runbooks/incidents/argocd-version-skew.md`). `stable` is the safe default; a
+pinned version is a value you must re-check against the k3s version from §1 on
+every rebuild.
+
 ```bash
+# REVIEWED VALUE — check on every rebuild. `stable` tracks the current release.
+# If you pin a tag (e.g. v3.4.6) instead, it MUST be new enough for the
+# Kubernetes version installed in §1 — newer is fine, older is not.
+ARGOCD_VERSION=stable
+
 kubectl create namespace argocd
 kubectl apply -n argocd \
-  -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.3/manifests/install.yaml
+  -f "https://raw.githubusercontent.com/argoproj/argo-cd/$ARGOCD_VERSION/manifests/install.yaml"
 
 # Two argocd-cm tweaks this single-node, no-LoadBalancer stack needs (see
 # runbooks/incidents/argocd-resource-tracking.md):
@@ -76,11 +98,22 @@ kubectl -n argocd patch configmap argocd-cm --type merge -p '{"data":{
 kubectl -n argocd rollout restart statefulset/argocd-application-controller
 ```
 
+`install.yaml` **contains `argocd-cm`**: whenever you (re-)apply it — first
+install, and every later upgrade — the two patches above are overwritten and
+must be applied again. Upgrading and forgetting them silently re-introduces
+both traps from `runbooks/incidents/argocd-resource-tracking.md`.
+
 **Verify:**
 
 ```bash
 kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=300s
 kubectl -n argocd get pods   # server, repo-server, application/applicationset controllers Running
+# Argo CD version vs. cluster version — Argo must not be the older of the two.
+kubectl -n argocd get deploy argocd-server \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl version -o json | jq -r .serverVersion.gitVersion
+# The patches survived the apply (both keys present):
+kubectl -n argocd get cm argocd-cm -o jsonpath='{.data}' | tr ',' '\n' | grep -E 'resourceTrackingMethod|Ingress'
 ```
 
 ## 3. Bootstrap Argo CD from this repo
@@ -128,6 +161,15 @@ kubectl -n kube-system get ds traefik    # DESIRED 1, READY 1
 curl -sI http://{{ domain }}             # answers (404 is fine — Traefik is up)
 ```
 
+An Application showing `SYNC: Unknown` while `HEALTH: Healthy` is **not** fine —
+that is the version-skew failure from §2. Read the reason, do not continue:
+
+```bash
+kubectl -n argocd get app <name> -o jsonpath='{.status.conditions}'
+# "field not declared in schema" → Argo CD is too old for this cluster,
+# see runbooks/incidents/argocd-version-skew.md
+```
+
 ## 4. Seal the ZITADEL bootstrap secrets
 
 ```bash
@@ -165,13 +207,41 @@ projects, roles, OIDC clients and above all who is in which role — is **not**
 done here: it is API-managed at runtime (invariant 6,
 `runbooks/zitadel-identity-via-api.md`). Do not commit memberships to tofu.
 
-Mint an operator service-user PAT/key in the ZITADEL console (Instance →
-Service Users → IAM-owner), provide it **per session** (never commit it, never
-store it in the cluster as a standing credential), then:
+**No human console step is needed here.** ZITADEL's setup job has already
+created the machine user `iam-admin` and stored its **JWT profile** as the k8s
+secret `zitadel/iam-admin`, and the provider authenticates with
+`jwt_profile_file` (`tofu/zitadel/main.tf`). Use that credential **once**, then
+revoke it: §5.3 is a mandatory part of this step, not a cleanup footnote. The
+invariant forbids a *standing* provider credential on disk or in the cluster —
+using the chart's key for one apply and revoking it immediately satisfies it
+more strictly than a hand-minted PAT that stays valid until someone remembers
+it (invariants 3 + 6, `tofu/zitadel/README.md`).
+
+### 5.1 Take the credential out for this session
 
 ```bash
 kubectl create namespace terraform-state
-cd tofu/zitadel && tofu init && tofu apply   # provider reads the per-session operator credential
+cd tofu/zitadel
+umask 077       # the credential must not be world-readable, not even briefly
+kubectl -n zitadel get secret iam-admin \
+  -o jsonpath='{.data.iam-admin\.json}' | base64 -d > service-user.json
+chmod 600 service-user.json
+```
+
+`service-user.json` is the default of `var.jwt_profile_file` and is gitignored
+(`tofu/zitadel/.gitignore`) — never commit it, never copy it elsewhere.
+
+**Verify:**
+
+```bash
+jq -re '.userId, .keyId' service-user.json   # both non-empty
+git check-ignore -v service-user.json        # must print a .gitignore rule
+```
+
+### 5.2 Apply the bootstrap
+
+```bash
+tofu init && tofu apply    # provider reads ./service-user.json
 ```
 
 **Verify:**
@@ -179,6 +249,30 @@ cd tofu/zitadel && tofu init && tofu apply   # provider reads the per-session op
 ```bash
 tofu output -raw admin_initial_password    # read once, store in password manager
 ```
+
+### 5.3 Revoke the credential (mandatory — do not skip)
+
+```bash
+shred -u service-user.json 2>/dev/null || rm -f service-user.json
+kubectl -n zitadel delete secret iam-admin
+```
+
+Then invalidate the key itself, so the copy you just used cannot be replayed:
+console → Instance → Users → Service Users → `iam-admin` → Keys → delete the
+key (or deactivate the user).
+
+**Verify:**
+
+```bash
+test ! -e service-user.json && echo "local credential gone"
+kubectl -n zitadel get secret iam-admin   # → Error ... "iam-admin" not found
+```
+
+A later ZITADEL chart upgrade re-runs the setup job and may recreate
+`zitadel/iam-admin` — check for it after every upgrade and delete it again.
+That is also the way back to a bootstrap credential if you ever need §5.1
+again. If the secret is gone and no setup job will run (rebuild case), mint an
+operator service-user PAT in the console instead — `tofu/zitadel/README.md`.
 
 Log in at `https://id.{{ domain }}` as `admin` with that password (forced
 change on first login), then do all further identity work via the console /
