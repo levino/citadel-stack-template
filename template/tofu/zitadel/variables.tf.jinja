@@ -8,16 +8,18 @@ variable "jwt_profile_file" {
   type        = string
   description = <<-EOT
     Path to the ZITADEL service-user key JSON used by the provider for the
-    one-time bootstrap apply. This is an OPERATOR-HELD credential, provided
-    per session and never committed, never stored in the cluster as a standing
-    credential (invariants 3 + 6 — see README.md). Prefer minting a scoped
-    service-user PAT/key in the console for the session and discarding it
-    afterwards.
+    one-time bootstrap apply. Provided per session, never committed, never
+    left as a standing credential (invariants 3 + 6 — see README.md).
 
-    Anti-pattern (do not do this on a real instance): parking the chart's
-    iam-admin key from the zitadel k8s secret on disk as the permanent
-    provider credential. The CI harness does extract it, but CI is a throwaway
-    cluster — production identity work is API/console, not standing tofu.
+    The documented path is: extract the chart's iam-admin JWT profile from the
+    k8s secret zitadel/iam-admin, apply once, then delete the file AND the
+    secret and invalidate the key (README.md step 4). That keeps the bootstrap
+    fully automatable without a console step.
+
+    Anti-pattern (do not do this): leaving that key on disk or in the cluster
+    as the permanent provider credential. The rule is about persistence, not
+    about use — a standing IAM-owner key that outlives the bootstrap is the
+    thing that is forbidden.
 
     The file is gitignored and must never be committed.
   EOT

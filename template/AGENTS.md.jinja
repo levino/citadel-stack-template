@@ -74,10 +74,14 @@ Read this file first. For any non-trivial operation there is a runbook:
    data must never live in version control (it is hard to delete, gets
    replicated, persists in history); (b) it changes far too often for a code
    loop. `tofu/zitadel/` holds at most the bare instance/org bootstrap. The
-   API credential is a ZITADEL **service-user PAT held by the operator** and
-   passed per session — it is **never stored in the cluster** (no
-   service-account key, no PAT as a k8s secret). See `tofu/zitadel/README.md`
-   and `runbooks/zitadel-identity-via-api.md`.
+   API credential is passed **per session** and is **never committed** and
+   **never left standing** — the bootstrap uses the chart's `iam-admin` JWT
+   profile once and then deletes the secret and revokes the key
+   (`runbooks/bootstrap-from-zero.md` §5.3); afterwards, day-to-day identity
+   work uses an operator-held service-user PAT, used and discarded. What is
+   forbidden is a *standing* admin credential in the cluster or on disk, not
+   its one-shot bootstrap use. See `tofu/zitadel/README.md` and
+   `runbooks/zitadel-identity-via-api.md`.
 7. **ZITADEL is an IdP, not a CRM.** Domain data (fees, join dates,
    membership numbers) belongs in app databases, keyed by the token `sub`.
 8. **Single node, single replica is a feature** (cheap infra). Do not add
