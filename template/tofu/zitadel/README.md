@@ -85,20 +85,20 @@ Synced/Healthy). Fully scriptable, no console step:
    tofu output -raw admin_initial_password
    ```
 
-4. **Revoke the credential — mandatory, verified:**
+4. **Revoke the credential — mandatory, and in this order:** revoke the key
+   and deactivate the machine user via the API, then **prove the revocation
+   worked while you still hold the key** (request a token with the JWT profile
+   again — it must fail), and only then destroy the key material (file +
+   `zitadel/iam-admin` secret). Full commands, including the
+   `urn:ietf:params:oauth:grant-type:jwt-bearer` negative test:
+   `runbooks/bootstrap-from-zero.md` §5.3.
 
-   ```bash
-   shred -u service-user.json 2>/dev/null || rm -f service-user.json
-   kubectl -n zitadel delete secret iam-admin
-   test ! -e service-user.json && echo "local credential gone"
-   kubectl -n zitadel get secret iam-admin   # → NotFound
-   ```
-
-   Then invalidate the key itself in ZITADEL (console → Instance → Users →
-   Service Users → `iam-admin` → Keys → delete, or deactivate the user), so
-   the copy that was on disk cannot be replayed. A later chart upgrade re-runs
-   the setup job and may recreate `zitadel/iam-admin` — check after every
-   ZITADEL upgrade and delete it again.
+   Do not shorten this to "delete the file and the secret". The API answering
+   HTTP 200 twice is not evidence that the credential is dead, and once the
+   profile is gone you can never test it: a revocation that silently did not
+   take leaves a valid IAM-owner credential in the instance with nobody
+   watching. A later chart upgrade re-runs the setup job and may recreate
+   `zitadel/iam-admin` — check after every ZITADEL upgrade and delete it again.
 
 **Alternative (rebuild case):** if the secret no longer exists and no setup job
 will recreate it, mint an operator service-user PAT by hand instead — console →

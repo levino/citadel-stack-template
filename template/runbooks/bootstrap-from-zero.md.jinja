@@ -13,9 +13,16 @@ Total time: ~30–45 minutes, most of it waiting for ZITADEL's first start.
   root access, ports 80/443 free (no other web server running).
 - DNS: `*.{{ domain }}` (wildcard A record) → `{{ server_ipv4 }}`.
 - This repo pushed to `https://github.com/{{ github_owner }}/{{ project_name }}`.
-- **On the server: `curl` and `git`.** A minimal Debian/Ubuntu install ships
-  neither, and §3–§4 clone this repo on the server and push the sealed secrets
-  back from it: `sudo apt-get update && sudo apt-get install -y curl git`.
+- **On the server: `git`, `curl`, `unzip`, `gnupg`, `jq`.** A minimal
+  Debian/Ubuntu image ships none of them (verified on Debian 13 trixie), and
+  each bites in a different step: §1 pipes `get.k3s.io` through `curl`, §3–§4
+  clone this repo and push the sealed secrets back from the server, §5 installs
+  OpenTofu (`unzip` + `gnupg`), and the verify commands in §2/§5 parse JSON with
+  `jq`. Install them all up front, in one go:
+
+  ```bash
+  sudo apt-get update && sudo apt-get install -y git curl unzip gnupg jq
+  ```
 - Locally (or on the agent's machine): `kubectl`, `kubeseal`, `tofu`, `git`
   (the `argocd` CLI is handy but optional — everything works via `kubectl`).
 
@@ -29,7 +36,9 @@ dig +short id.{{ domain }} anything.{{ domain }}
 **Verify the server's tooling:**
 
 ```bash
-curl --version | head -1 && git --version   # both must print a version
+for t in git curl unzip gpg jq; do
+  command -v "$t" >/dev/null || echo "MISSING: $t"
+done   # prints nothing when all of them are present
 ```
 
 ## 1. Install k3s
@@ -240,6 +249,19 @@ git check-ignore -v service-user.json        # must print a .gitignore rule
 
 ### 5.2 Apply the bootstrap
 
+If OpenTofu is not on the server yet:
+
+```bash
+curl -fsSL https://get.opentofu.org/install-opentofu.sh -o /tmp/install-opentofu.sh
+chmod +x /tmp/install-opentofu.sh && /tmp/install-opentofu.sh --install-method standalone
+```
+
+> The installer needs `unzip` and `gnupg` (§0). Without them it exits 1 after
+> printing a single line — `Unzip is missing, please install it to use the
+> standalone installation method.` — and nothing else. Run from a background
+> job or a script, all you see is "exit code 1"; do not go hunting elsewhere,
+> just install the packages from §0.
+
 ```bash
 tofu init && tofu apply    # provider reads ./service-user.json
 ```
@@ -247,24 +269,93 @@ tofu init && tofu apply    # provider reads ./service-user.json
 **Verify:**
 
 ```bash
+tofu version                               # installer worked
 tofu output -raw admin_initial_password    # read once, store in password manager
 ```
 
 ### 5.3 Revoke the credential (mandatory — do not skip)
 
+**Order matters: revoke → prove the revocation while you still hold the key →
+destroy the key material last.** Destroying the JWT profile first (the obvious
+order) leaves you with two HTTP 200s and no way to test anything: you can no
+longer authenticate, so you cannot tell a revoked credential from a working
+one. The error direction here is asymmetric — a revocation that silently did
+not take leaves a **valid IAM-owner credential** in the instance, and nobody
+finds out. Do not continue past a failing verify in this step.
+
+Helpers (need `jq` and `openssl`; `$PROFILE` is the file from §5.1):
+
 ```bash
-shred -u service-user.json 2>/dev/null || rm -f service-user.json
-kubectl -n zitadel delete secret iam-admin
+ZID=https://id.{{ domain }}
+PROFILE=./service-user.json
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+zitadel_jwt() {   # RS256, signed with the key from the JWT profile
+  local now kid uid hdr claims si
+  now=$(date +%s)
+  kid=$(jq -r .keyId "$PROFILE"); uid=$(jq -r .userId "$PROFILE")
+  (umask 077; jq -r .key "$PROFILE" > "$PROFILE.pem")
+  hdr=$(printf '{"alg":"RS256","typ":"JWT","kid":"%s"}' "$kid" | b64url)
+  claims=$(printf '{"iss":"%s","sub":"%s","aud":"%s","iat":%s,"exp":%s}' \
+    "$uid" "$uid" "$ZID" "$now" "$((now + 300))" | b64url)
+  si="$hdr.$claims"
+  printf '%s.%s' "$si" \
+    "$(printf '%s' "$si" | openssl dgst -sha256 -sign "$PROFILE.pem" | b64url)"
+}
+zitadel_token() {   # raw token response — JSON with access_token, or an error
+  curl -sS -X POST "$ZID/oauth/v2/token" \
+    -d grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer \
+    --data-urlencode "assertion=$(zitadel_jwt)" \
+    --data-urlencode 'scope=openid urn:zitadel:iam:org:project:id:zitadel:aud'
+}
 ```
 
-Then invalidate the key itself, so the copy you just used cannot be replayed:
-console → Instance → Users → Service Users → `iam-admin` → Keys → delete the
-key (or deactivate the user).
+**1. Revoke the key and deactivate the machine user:**
+
+```bash
+TOKEN=$(zitadel_token | jq -r .access_token)
+USER_ID=$(jq -r .userId "$PROFILE"); KEY_ID=$(jq -r .keyId "$PROFILE")
+curl -fsS -X DELETE "$ZID/management/v1/users/$USER_ID/keys/$KEY_ID" \
+  -H "Authorization: Bearer $TOKEN"
+curl -fsS -X POST "$ZID/management/v1/users/$USER_ID/_deactivate" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Both answer HTTP 200 with a ZITADEL change sequence. **Two 200s are not
+proof** — they say the API accepted the calls, not that the credential is dead.
+(Same thing via console: Instance → Users → Service Users → `iam-admin` → Keys
+→ delete, then deactivate the user. The negative test below is required either
+way.)
+
+**2. Verify — negative test, run it while the JWT profile still exists:**
+
+```bash
+zitadel_token                        # read it: must be an error, not a token
+zitadel_token | jq -e 'has("access_token")' >/dev/null \
+  && echo "FAIL: revoked credential still mints tokens — DO NOT CONTINUE" \
+  || echo "revocation verified: the credential can no longer authenticate"
+```
+
+Read the first line, do not just run it: an empty response or an HTML error
+page also takes the "verified" branch, and that proves nothing — it means the
+request never reached ZITADEL. A pass is ZITADEL answering with an OAuth error
+(`invalid_grant` / key not found).
+
+If it still mints an `access_token`: **stop**. The revocation did not take —
+re-check that you targeted the right `userId`/`keyId`, repeat step 1, and do
+**not** destroy the profile in the meantime. It is the only thing that lets you
+test again.
+
+**3. Only now destroy the key material:**
+
+```bash
+shred -u "$PROFILE" "$PROFILE.pem" 2>/dev/null || rm -f "$PROFILE" "$PROFILE.pem"
+kubectl -n zitadel delete secret iam-admin
+```
 
 **Verify:**
 
 ```bash
-test ! -e service-user.json && echo "local credential gone"
+test ! -e "$PROFILE" && test ! -e "$PROFILE.pem" && echo "local credential gone"
 kubectl -n zitadel get secret iam-admin   # → Error ... "iam-admin" not found
 ```
 
