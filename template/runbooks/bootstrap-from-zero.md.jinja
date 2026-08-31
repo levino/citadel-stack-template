@@ -800,10 +800,14 @@ in this template:
   reconciles: on a running instance the first plan is a delete plan for
   everything created by hand. Re-adopting it requires `tofu import` first.
 
-**What this costs, stated plainly:** the instance is no longer reproducible from
-git. A rebuild yields an empty ZITADEL, not a copy of what you had. The
-countermeasure is not more IaC — it is a **backup of the Postgres database**,
-where the whole content lives. Without that backup, hand work is unrecoverable.
+**Where the line runs:** git derives the *infrastructure* — deployment,
+database, masterkey, ingress. It never held the *content*: organizations, users,
+roles, SMTP. That was never the claim and should not become one — personal data
+does not belong in a repository.
+
+The content lives in Postgres, which is what makes a **database backup** the
+thing that matters here, not more IaC. A rebuild restores the infrastructure
+from git and the content from that backup.
 
 ## 6. ForwardAuth front door (optional but recommended)
 
