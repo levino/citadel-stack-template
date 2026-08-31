@@ -9,7 +9,7 @@ resources:
 # Applications (argocd/applications/zitadel*.yaml), not from here. This
 # directory holds only the namespace and the sealed bootstrap secrets.
 #
-# The two sealed-*.yaml files are created during bootstrap by
+# The three sealed-*.yaml files are created during bootstrap by
 # scripts/seal-zitadel-secrets.sh — see SECRETS.md. Until they are
 # committed, the `zitadel-base` Application stays OutOfSync on purpose while
 # the rest of the substrate stays healthy.

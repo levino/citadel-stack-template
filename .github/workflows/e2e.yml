@@ -51,7 +51,7 @@ jobs:
             "$DERIVATIVE"/argocd/applications/*.yaml
           # zitadel/ references sealed secrets that only exist after sealing
           # against a live cluster — validate the build with placeholders.
-          for name in masterkey db-credentials; do
+          for name in masterkey first-admin db-credentials; do
             cat > "$DERIVATIVE/zitadel/sealed-zitadel-$name.yaml" <<EOF
           apiVersion: bitnami.com/v1alpha1
           kind: SealedSecret
