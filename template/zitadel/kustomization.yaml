@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - sealed-zitadel-masterkey.yaml
+  - sealed-zitadel-first-admin.yaml
   - sealed-zitadel-db-credentials.yaml
 # ZITADEL and Postgres themselves are Helm charts deployed as Argo CD
 # Applications (argocd/applications/zitadel*.yaml), not from here. This

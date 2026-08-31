@@ -29,6 +29,18 @@ kubectl create secret generic zitadel-masterkey \
   | kubeseal --cert "$CERT" -o yaml \
   > zitadel/sealed-zitadel-masterkey.yaml
 
+# Password of the first human. Without it ZITADEL inserts its documented
+# `Password1!` and creates an immediately usable IAM_OWNER account. Random, so
+# nobody knows it — and nobody needs it: §5.3 creates the administrator you use.
+FIRST_ADMIN_PASSWORD="$(openssl rand -base64 30 | tr -d '/+=' | head -c 32)!7"
+
+kubectl create secret generic zitadel-first-admin \
+  --namespace=zitadel \
+  --from-literal=password="$FIRST_ADMIN_PASSWORD" \
+  --dry-run=client -o yaml \
+  | kubeseal --cert "$CERT" -o yaml \
+  > zitadel/sealed-zitadel-first-admin.yaml
+
 kubectl create secret generic zitadel-db-credentials \
   --namespace=zitadel \
   --from-literal=postgresPassword="$POSTGRES_PASSWORD" \
@@ -38,5 +50,6 @@ kubectl create secret generic zitadel-db-credentials \
   > zitadel/sealed-zitadel-db-credentials.yaml
 
 echo "Wrote zitadel/sealed-zitadel-masterkey.yaml"
+echo "Wrote zitadel/sealed-zitadel-first-admin.yaml"
 echo "Wrote zitadel/sealed-zitadel-db-credentials.yaml"
 echo "Commit both files — Argo CD will reconcile the zitadel-base Application."
