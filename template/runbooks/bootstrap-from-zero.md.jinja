@@ -787,14 +787,15 @@ the **existence**: deployment, database, masterkey, ingress.
 Two mechanisms have to be held back for that, and both are configured that way
 in this template:
 
-- The `zitadel`, `zitadel-base` and `zitadel-postgresql` Applications run
-  **without `automated`**. Argo still reports drift as `OutOfSync`, but does not
-  act. Sync only on purpose, and read the diff first — a sync after a chart
-  upgrade re-runs the setup job, which reaches into `FirstInstance` again.
+- The `zitadel`, `zitadel-base` and `zitadel-postgresql` Applications run with
+  `automated` but **`prune: false` and `selfHeal: false`**. The first sync has to
+  happen — without it the instance is never created and a bootstrap waits forever
+  for `Healthy`. After that Argo neither reverts drift on the live objects nor
+  deletes anything that disappears from git.
 
-  ```bash
-  kubectl -n argocd patch application zitadel --type merge -p '{"operation":{"sync":{}}}'
-  ```
+  A further sync only happens when the source in git changes, which is a
+  deliberate act. Read the diff before you make one: a chart upgrade re-runs the
+  setup job, which reaches into `FirstInstance` again.
 
 - **`tofu/zitadel/` is not applied again.** It manages structure, but Terraform
   reconciles: on a running instance the first plan is a delete plan for

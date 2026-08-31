@@ -49,20 +49,23 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: zitadel
-  # BEWUSST OHNE automated. ZITADEL wird einmal angelegt und danach von Hand
-  # verwaltet -- Organisationen, Nutzer, Rollen, SMTP, IdPs. Deklarativ geregelt
-  # ist hier nur noch die EXISTENZ: Deployment, Datenbank, Masterkey, Ingress.
+  # ZITADEL wird einmal angelegt und danach VON HAND verwaltet -- Organisationen,
+  # Nutzer, Rollen, SMTP, IdPs. Deklarativ bleibt nur die Existenz.
   #
-  # Mit selfHeal wuerde Argo jede Abweichung zurueckdrehen und prune loeschen,
-  # was aus Git verschwindet. Der Inhalt liegt zwar in Postgres und wird davon
-  # nicht direkt beruehrt -- aber ein Sync nach einem Chart-Upgrade laesst den
+  # Deshalb automated MIT prune: false UND selfHeal: false:
+  #   - der erste Sync passiert von selbst, sonst entstuende die Instanz nie
+  #     (ganz ohne automated wartet ein Bootstrap ewig auf Healthy);
+  #   - selfHeal: false -- Argo dreht Abweichungen an den Live-Objekten NICHT
+  #     zurueck;
+  #   - prune: false -- Argo loescht nie etwas, das aus Git verschwindet.
+  #
+  # Ein weiterer Sync passiert nur, wenn sich die Quelle in Git aendert, also
+  # durch eine bewusste Handlung. Vorsicht dabei: ein Chart-Upgrade laesst den
   # Setup-Job neu laufen, der wieder in FirstInstance greift.
-  #
-  # Argo zeigt Abweichungen weiterhin als OutOfSync an, handelt aber nicht.
-  # Ein Sync passiert nur noch bewusst:
-  #     kubectl -n argocd patch application <name> --type merge \
-  #       -p '{"operation":{"sync":{}}}'
   syncPolicy:
+    automated:
+      prune: false
+      selfHeal: false
     syncOptions:
       - CreateNamespace=true
     retry:
