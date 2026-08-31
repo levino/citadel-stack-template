@@ -76,8 +76,21 @@ spec:
                     Mode: disable
                   # Password via env ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD
             # The setup job creates the machine user `iam-admin` (chart default)
-            # and stores its JWT profile as k8s secret zitadel/iam-admin — that
-            # is the credential OpenTofu uses (tofu/zitadel/README.md).
+            # and stores its JWT profile as k8s secret zitadel/iam-admin — the
+            # ONE-SHOT bootstrap credential for OpenTofu, deleted and revoked
+            # right after the apply (tofu/zitadel/README.md step 4). It must
+            # never stay in the cluster as a standing credential.
+            #
+            # FirstInstance.Org.Human is deliberately NOT set here — a plaintext
+            # password must never sit in this repo. Do NOT read that as "no
+            # human admin is created": ZITADEL falls back to its own published
+            # defaults and creates
+            #     zitadel-admin@zitadel.id.{{ domain }} / Password1!  (IAM_OWNER, active)
+            # An omitted value yields the VENDOR's default, not nothing. That
+            # password MUST be changed in the same session as the deploy, and
+            # the change proven with a failed login — runbooks/bootstrap-from-zero.md
+            # §5.2, runbooks/incidents/zitadel-default-admin.md, AGENTS.md inv. 9.
+            # Setting it here instead would only move the problem into git.
 
         replicaCount: 1
 

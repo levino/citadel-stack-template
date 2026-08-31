@@ -88,14 +88,45 @@ Read this file first. For any non-trivial operation there is a runbook:
    data must never live in version control (it is hard to delete, gets
    replicated, persists in history); (b) it changes far too often for a code
    loop. `tofu/zitadel/` holds at most the bare instance/org bootstrap. The
-   API credential is a ZITADEL **service-user PAT held by the operator** and
-   passed per session — it is **never stored in the cluster** (no
-   service-account key, no PAT as a k8s secret). See `tofu/zitadel/README.md`
-   and `runbooks/zitadel-identity-via-api.md`.
+   API credential is passed **per session** and is **never committed** and
+   **never left standing** — the bootstrap uses the chart's `iam-admin` JWT
+   profile once and then deletes the secret and revokes the key
+   (`runbooks/bootstrap-from-zero.md` §5.4 — **never before** §5.2 has produced
+   a verified human IAM_OWNER, or the revocation cuts off instance level
+   entirely); afterwards, day-to-day identity
+   work uses an operator-held service-user PAT, used and discarded. What is
+   forbidden is a *standing* admin credential in the cluster or on disk, not
+   its one-shot bootstrap use. See `tofu/zitadel/README.md` and
+   `runbooks/zitadel-identity-via-api.md`.
 7. **ZITADEL is an IdP, not a CRM.** Domain data (fees, join dates,
    membership numbers) belongs in app databases, keyed by the token `sub`.
 8. **Single node, single replica is a feature** (cheap infra). Do not add
    HA machinery.
+9. **No vendor default credential ever survives its bootstrap — not for an
+   hour, not "only until the next step".** Any component that ships a
+   documented default login gets it changed (or the account removed) **in the
+   same session that created it**, before the service is left running
+   unattended. This is not a rule about *weak* passwords. A weak password is
+   one somebody **chose** — it exists in a human's head, and it appears in the
+   handover. The dangerous ones are the passwords **nobody chose**: silently
+   set by the software from its own published defaults, on an account nobody
+   knows exists. "Use good passwords" cannot catch those, because nobody is
+   looking. What catches them is an **inventory**. Therefore:
+   - **Omitting a configuration value does not produce nothing — it produces
+     the vendor's default, and the vendor's default is public.** Leaving out
+     `FirstInstance.Org.Human` (deliberately, to keep a plaintext password out
+     of git) is exactly what created a live `zitadel-admin@zitadel.id.{{ domain }}`
+     with `Password1!` and IAM_OWNER on the open internet —
+     `runbooks/incidents/zitadel-default-admin.md`.
+   - After every bootstrap, **and after every chart upgrade that re-runs a
+     setup job**, you **enumerate the accounts that actually exist** and their
+     privileges (`runbooks/bootstrap-from-zero.md` §5.2). Never reason from
+     "we did not configure a user" to "no user was created", and never hand
+     over a system whose administrator list you have not read.
+   - Proof is a **failed authentication with the default value**, run against
+     the live service — never the claim "the password was changed". Pair it
+     with a positive control (the new password must succeed), or a typo in the
+     login name will hand you a green negative test that means nothing.
 
 ## Layout
 
@@ -125,6 +156,20 @@ kubectl describe node | grep -A5 Conditions   # no DiskPressure (see incidents/)
 kubectl get secret -A --field-selector type=kubernetes.io/dockerconfigjson \
   -o custom-columns=NS:.metadata.namespace,SECRET:.metadata.name,\
 OWNER:.metadata.annotations.owner,EXPIRES:.metadata.annotations.expires
+
+# Who holds INSTANCE-level rights right now? Reads ZITADEL's projection
+# directly, so it works with no ZITADEL credential at all (inv. 9; full query
+# and the API route in runbooks/bootstrap-from-zero.md §5.2). Expect exactly
+# the accounts you can name — an unexplained human IAM_OWNER is an incident.
+kubectl -n zitadel exec -i statefulset/zitadel-postgresql -- env \
+  PGPASSWORD="$(kubectl -n zitadel get secret zitadel-db-credentials \
+    -o jsonpath='{.data.postgresPassword}' | base64 -d)" \
+  psql -U postgres -d zitadel -At -F'|' -c \
+  "SELECT u.username, u.type, u.state, array_to_string(m.roles, ',')
+     FROM projections.instance_members4 m
+     JOIN projections.users14 u
+       ON u.id = m.user_id AND u.instance_id = m.instance_id;"
+# type 1=human 2=machine · state 1=active 2=inactive 4=locked 6=initial
 ```
 
 (With the Argo CD CLI logged in, `argocd app list` shows the same.)

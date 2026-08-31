@@ -19,6 +19,13 @@ Mint it in the console: Instance → Service Users → create a service user →
 grant it the IAM-owner (or a narrower) manager role → generate a **Personal
 Access Token**. Then for the session:
 
+> Minting it needs an account that is an **instance** administrator
+> (`IAM_OWNER`). An `ORG_OWNER` — which is all the tofu bootstrap creates —
+> cannot: the Instance menu is `403` for it. If you are locked out at that
+> level, `runbooks/bootstrap-from-zero.md` §5.2 shows how to find out who *is*
+> an instance administrator (readable from Postgres, no credential needed);
+> §5.4.0 is the step that was supposed to prevent the lock-out.
+
 ```bash
 export ZITADEL_TOKEN="<service-user-PAT>"
 export ZITADEL_HOST="https://id.{{ domain }}"
@@ -31,9 +38,10 @@ zreq() { curl -fsS -H "Authorization: Bearer $ZITADEL_TOKEN" \
   -H 'Content-Type: application/json' "$ZITADEL_HOST$@"; }
 ```
 
-> **Anti-pattern (do not):** extracting the chart's `iam-admin` key and
-> parking it on disk or as a k8s secret as a standing admin credential. Mint a
-> scoped PAT, use it, discard it.
+> **Anti-pattern (do not):** *keeping* the chart's `iam-admin` key on disk or
+> as a k8s secret as a standing admin credential. The bootstrap uses that key
+> exactly once and revokes it (`runbooks/bootstrap-from-zero.md` §5.4); for
+> day-to-day identity work it is gone — mint a scoped PAT, use it, discard it.
 
 ## Common operations
 

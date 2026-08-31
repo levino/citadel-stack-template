@@ -9,10 +9,20 @@ Total time: ~30–45 minutes, most of it waiting for ZITADEL's first start.
 
 ## 0. Prerequisites
 
-- A server (Ubuntu, {{ target_arch }}) reachable at `{{ server_ipv4 }}`,
+- A server (Ubuntu or Debian, {{ target_arch }}) reachable at `{{ server_ipv4 }}`,
   root access, ports 80/443 free (no other web server running).
 - DNS: `*.{{ domain }}` (wildcard A record) → `{{ server_ipv4 }}`.
 - This repo pushed to `https://github.com/{{ github_owner }}/{{ project_name }}`.
+- **On the server: `git`, `curl`, `unzip`, `gnupg`, `jq`.** A minimal
+  Debian/Ubuntu image ships none of them (verified on Debian 13 trixie), and
+  each bites in a different step: §1 pipes `get.k3s.io` through `curl`, §3–§4
+  clone this repo and push the sealed secrets back from the server, §5 installs
+  OpenTofu (`unzip` + `gnupg`), and the verify commands in §2/§5 parse JSON with
+  `jq`. Install them all up front, in one go:
+
+  ```bash
+  sudo apt-get update && sudo apt-get install -y git curl unzip gnupg jq
+  ```
 - Locally (or on the agent's machine): `kubectl`, `kubeseal`, `tofu`, `git`
   (the `argocd` CLI is handy but optional — everything works via `kubectl`).
 
@@ -23,7 +33,17 @@ dig +short id.{{ domain }} anything.{{ domain }}
 # both → {{ server_ipv4 }}
 ```
 
-## 1. Install k3s
+**Verify the server's tooling:**
+
+```bash
+for t in git curl unzip gpg jq; do
+  command -v "$t" >/dev/null || echo "MISSING: $t"
+done   # prints nothing when all of them are present
+```
+
+## 1. Install k3s and close the host
+
+### 1.1 Install k3s
 
 On the server, as root:
 
@@ -50,15 +70,149 @@ kubectl get node   # one node, STATUS Ready
 ```
 
 To operate remotely, add a `tls-san` for your API domain in
-`/etc/rancher/k3s/config.yaml` and open 6443 (see §8); for a first
-bootstrap, running directly on the server is fine.
+`/etc/rancher/k3s/config.yaml` and open 6443 in the §1.2 guard (see §8); for a
+first bootstrap, running directly on the server is fine.
+
+### 1.2 Host firewall
+
+Do this **now**, not later: between the k3s install and this step, the cluster
+API is on the public internet.
+
+k3s opens these on all interfaces, without asking:
+
+| Port | Service |
+|---|---|
+| 6443/tcp | kube-apiserver |
+| 10250/tcp | kubelet API |
+| 10248, 10249, 10256–10259/tcp | component ports (bound to 127.0.0.1, listed for completeness) |
+| 8472/udp | flannel VXLAN — **unauthenticated** |
+
+VXLAN is the serious one: whoever can send UDP 8472 to the node injects packets
+straight into the pod network, bypassing Traefik, ForwardAuth and ZITADEL
+entirely.
+
+**`ufw` does not close these — and it looks like it does, which is worse.** k3s
+inserts its chains ahead of ufw's and accepts marked traffic before ufw is ever
+reached. The INPUT chain after `ufw enable`:
+
+```
+-P INPUT DROP
+-A INPUT ... -j KUBE-ROUTER-INPUT
+-A INPUT ... -j KUBE-PROXY-FIREWALL
+-A INPUT ... -j KUBE-NODEPORTS
+-A INPUT ... -j KUBE-EXTERNAL-SERVICES
+-A INPUT -j KUBE-FIREWALL
+-A INPUT ... -m mark --mark 0x20000/0x20000 -j ACCEPT   <-- accepted here already
+-A INPUT -j ufw-before-input                            <-- ufw only runs here
+```
+
+With `ufw default deny incoming` set and `ufw status` looking correct, 6443 and
+10250 stay reachable from the internet — measured from an external host, not
+read off the ruleset. Inserting plain iptables rules is no answer either: k3s
+rewrites its chains regularly and they disappear.
+
+**What works** is an own nftables table hooked *before* the filter table. It
+runs ahead of the k3s chains and survives k3s rewriting its own rules:
+
+```bash
+sudo apt-get install -y nftables
+sudo mkdir -p /etc/nftables.d
+sudo tee /etc/nftables.d/k3sguard.nft >/dev/null <<'EOF'
+#!/usr/sbin/nft -f
+# Deliberately NO `flush ruleset` here — that would also wipe k3s's own
+# iptables-nft chains until it resyncs. Recreate only our own table.
+table inet k3sguard
+delete table inet k3sguard
+
+table inet k3sguard {
+    chain input {
+        type filter hook input priority -150; policy accept;
+        iif lo accept
+        ct state established,related accept
+        ip saddr { 127.0.0.0/8, 10.42.0.0/16, 10.43.0.0/16, {{ server_ipv4 }} } accept
+        iifname { "cni0", "flannel.1" } accept
+        # Operating kubectl from your laptop instead of the server? Add an
+        # accept for your admin IP ABOVE the drop, e.g.
+        #   ip saddr <your-admin-ip> tcp dport 6443 accept
+        # For the optional CI-OIDC case, open 6443 as described in §8.
+        tcp dport { 6443, 10248, 10249, 10250, 10256, 10257, 10258, 10259 } drop
+        udp dport 8472 drop
+    }
+}
+EOF
+grep -q 'nftables.d' /etc/nftables.conf \
+  || echo 'include "/etc/nftables.d/*.nft"' | sudo tee -a /etc/nftables.conf
+sudo systemctl enable --now nftables
+sudo nft -f /etc/nftables.conf
+```
+
+Re-running the file is safe: the `table` / `delete table` / `table { … }` idiom
+recreates only our own table, so rules never accumulate. `nft list ruleset`
+prints the priority as `mangle` (= -150) and may collapse the two CIDRs into
+`10.42.0.0/15` — both are display forms of what you wrote, not a modification.
+
+`policy accept` plus an explicit drop list is deliberate: this table closes the
+k3s ports and nothing else, so 22/80/443 stay open and it cannot lock you out
+of SSH. It is a guard, not a general firewall. `10.42.0.0/16` and
+`10.43.0.0/16` are k3s's default pod and service CIDRs; the node's own address
+must stay in the accept set, or the apiserver can no longer reach the kubelet
+and `kubectl logs`/`exec` break.
+
+If you want ufw on top (cosmetic here — the nft table does the work), set
+`DEFAULT_FORWARD_POLICY="ACCEPT"` in `/etc/default/ufw` first, otherwise the
+pod network breaks.
+
+**Verify — from an external host. Testing from the server proves nothing:**
+
+```bash
+# On a DIFFERENT machine, out on the public internet:
+nc -vz -w3 {{ server_ipv4 }} 443     # succeeds
+nc -vz -w3 {{ server_ipv4 }} 6443    # must time out
+nc -vz -w3 {{ server_ipv4 }} 10250   # must time out
+sudo nmap -Pn -sU -p 8472 {{ server_ipv4 }}   # must not be open
+```
+
+Two traps here look like results and are not:
+
+- **Behind an egress proxy, every port reports open.** If the machine you scan
+  from routes through a proxy (corporate network, CI runner, sandboxed
+  container with `HTTP(S)_PROXY` set), the proxy accepts the TCP connection
+  locally and every port comes back open. Self-check first:
+  `nc -vz -w3 {{ server_ipv4 }} 6444` — nothing listens there, so if *that*
+  reads open you are measuring the proxy, not the server. Use a real external
+  host.
+- **A failing `kubectl exec` is not automatically a firewall problem.** Later
+  in the bootstrap, `kubectl exec` into ZITADEL fails because its distroless
+  image has no `sh`/`echo` — the error reads like a broken apiserver→kubelet
+  path but is only the image. Test that path with busybox instead.
+
+**Verify the cluster still works from the server:**
+
+```bash
+kubectl get node        # still Ready
+kubectl run fwcheck --rm -it --restart=Never --image=busybox:1.36 -- echo ok
+# ^ exercises the apiserver → kubelet path the node-IP accept rule keeps open
+```
 
 ## 2. Install Argo CD
 
+Argo CD is the one component installed imperatively — everything after it comes
+from git. **Do not pin an old release.** An Argo CD older than the cluster's
+Kubernetes version cannot build a typed diff against newer built-in schemas and
+stops reconciling *while still reporting Healthy*
+(`runbooks/incidents/argocd-version-skew.md`). `stable` is the safe default; a
+pinned version is a value you must re-check against the k3s version from §1 on
+every rebuild.
+
 ```bash
+# REVIEWED VALUE — check on every rebuild. `stable` tracks the current release.
+# If you pin a tag (e.g. v3.4.6) instead, it MUST be new enough for the
+# Kubernetes version installed in §1 — newer is fine, older is not.
+ARGOCD_VERSION=stable
+
 kubectl create namespace argocd
 kubectl apply -n argocd \
-  -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.3/manifests/install.yaml
+  -f "https://raw.githubusercontent.com/argoproj/argo-cd/$ARGOCD_VERSION/manifests/install.yaml"
 
 # Two argocd-cm tweaks this single-node, no-LoadBalancer stack needs (see
 # runbooks/incidents/argocd-resource-tracking.md):
@@ -76,11 +230,22 @@ kubectl -n argocd patch configmap argocd-cm --type merge -p '{"data":{
 kubectl -n argocd rollout restart statefulset/argocd-application-controller
 ```
 
+`install.yaml` **contains `argocd-cm`**: whenever you (re-)apply it — first
+install, and every later upgrade — the two patches above are overwritten and
+must be applied again. Upgrading and forgetting them silently re-introduces
+both traps from `runbooks/incidents/argocd-resource-tracking.md`.
+
 **Verify:**
 
 ```bash
 kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=300s
 kubectl -n argocd get pods   # server, repo-server, application/applicationset controllers Running
+# Argo CD version vs. cluster version — Argo must not be the older of the two.
+kubectl -n argocd get deploy argocd-server \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl version -o json | jq -r .serverVersion.gitVersion
+# The patches survived the apply (both keys present):
+kubectl -n argocd get cm argocd-cm -o jsonpath='{.data}' | tr ',' '\n' | grep -E 'resourceTrackingMethod|Ingress'
 ```
 
 ## 3. Bootstrap Argo CD from this repo
@@ -128,6 +293,15 @@ kubectl -n kube-system get ds traefik    # DESIRED 1, READY 1
 curl -sI http://{{ domain }}             # answers (404 is fine — Traefik is up)
 ```
 
+An Application showing `SYNC: Unknown` while `HEALTH: Healthy` is **not** fine —
+that is the version-skew failure from §2. Read the reason, do not continue:
+
+```bash
+kubectl -n argocd get app <name> -o jsonpath='{.status.conditions}'
+# "field not declared in schema" → Argo CD is too old for this cluster,
+# see runbooks/incidents/argocd-version-skew.md
+```
+
 ## 4. Seal the ZITADEL bootstrap secrets
 
 ```bash
@@ -158,6 +332,13 @@ kubectl get certificates -A             # all Ready=True
 curl -fsSI https://id.{{ domain }} > /dev/null && echo TLS OK
 ```
 
+> **Do not pause here.** The moment this verify passes, ZITADEL is on the
+> public internet **with an active IAM_OWNER account whose password is in the
+> vendor's documentation** — you did not configure it, ZITADEL created it from
+> its defaults. §5.1 + §5.2 close that window and are part of *this* sitting,
+> not of "tomorrow's identity work"
+> (`runbooks/incidents/zitadel-default-admin.md`, invariant 9).
+
 ## 5. ZITADEL bootstrap (instance/org only — NOT identity content)
 
 This stands up the org and the first admin user. **Identity content** —
@@ -165,24 +346,413 @@ projects, roles, OIDC clients and above all who is in which role — is **not**
 done here: it is API-managed at runtime (invariant 6,
 `runbooks/zitadel-identity-via-api.md`). Do not commit memberships to tofu.
 
-Mint an operator service-user PAT/key in the ZITADEL console (Instance →
-Service Users → IAM-owner), provide it **per session** (never commit it, never
-store it in the cluster as a standing credential), then:
+**No human console step is needed here.** ZITADEL's setup job has already
+created the machine user `iam-admin` and stored its **JWT profile** as the k8s
+secret `zitadel/iam-admin`, and the provider authenticates with
+`jwt_profile_file` (`tofu/zitadel/main.tf`). Use that credential **once**, then
+revoke it: §5.4 is a mandatory part of this step, not a cleanup footnote. The
+invariant forbids a *standing* provider credential on disk or in the cluster —
+using the chart's key for one apply and revoking it immediately satisfies it
+more strictly than a hand-minted PAT that stays valid until someone remembers
+it (invariants 3 + 6, `tofu/zitadel/README.md`).
+
+**Order in this section is load-bearing.** §5.2 (inventory + remove the vendor
+default admin) comes first because it is the only step with an exposure window,
+and §5.4 (revoke) comes last because it removes the credential every earlier
+step needs. Do not reorder them, and do not defer §5.2 "until the rest works" —
+that is exactly how an IAM_OWNER with a published default password stayed live
+on the internet for hours (`runbooks/incidents/zitadel-default-admin.md`).
+
+### 5.1 Take the credential out for this session
 
 ```bash
 kubectl create namespace terraform-state
-cd tofu/zitadel && tofu init && tofu apply   # provider reads the per-session operator credential
+cd tofu/zitadel
+umask 077       # the credential must not be world-readable, not even briefly
+kubectl -n zitadel get secret iam-admin \
+  -o jsonpath='{.data.iam-admin\.json}' | base64 -d > service-user.json
+chmod 600 service-user.json
+```
+
+`service-user.json` is the default of `var.jwt_profile_file` and is gitignored
+(`tofu/zitadel/.gitignore`) — never commit it, never copy it elsewhere.
+
+**Verify:**
+
+```bash
+jq -re '.userId, .keyId' service-user.json   # both non-empty
+git check-ignore -v service-user.json        # must print a .gitignore rule
+```
+
+### 5.2 Instance administrators: list them, then kill the vendor default
+
+**Do this before anything else touches the instance, and do not walk away
+between §4 and the verify at the end of this step.** Until it passes,
+`https://id.{{ domain }}` is a publicly reachable login form for an **IAM_OWNER
+account whose password is printed in the vendor's documentation** — the whole
+instance, not just the community org.
+
+`argocd/applications/zitadel.yaml` deliberately configures **no**
+`FirstInstance.Org.Human` — so that no plaintext password ever sits in this
+repo. That intent is right, and the conclusion drawn from it is wrong:
+**leaving the value out does not mean no human admin is created.** ZITADEL
+falls back to its own published defaults (`cmd/setup/steps.yaml` upstream) and
+creates one anyway:
+
+| | |
+|---|---|
+| Login name | `zitadel-admin@zitadel.id.{{ domain }}` (username + default org `ZITADEL` + `ExternalDomain`) |
+| Password | `Password1!` — the documented upstream default |
+| Instance role | `IAM_OWNER` |
+| State | active, email pre-verified |
+
+`PasswordChangeRequired: true` is **not** a mitigation. It only forces *the
+first person who logs in* to pick a new password — and nothing guarantees that
+person is you. On the open internet it is a race, and the attacker who wins it
+does not get a warning banner, they get the instance.
+
+Helpers for this step and §5.4 (need `jq` and `openssl`; `$PROFILE` is the file
+from §5.1) — define them once, in the shell you keep for the rest of §5:
+
+```bash
+ZID=https://id.{{ domain }}
+PROFILE=./service-user.json
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+zitadel_jwt() {   # RS256, signed with the key from the JWT profile
+  local now kid uid hdr claims si
+  now=$(date +%s)
+  kid=$(jq -r .keyId "$PROFILE"); uid=$(jq -r .userId "$PROFILE")
+  (umask 077; jq -r .key "$PROFILE" > "$PROFILE.pem")
+  hdr=$(printf '{"alg":"RS256","typ":"JWT","kid":"%s"}' "$kid" | b64url)
+  claims=$(printf '{"iss":"%s","sub":"%s","aud":"%s","iat":%s,"exp":%s}' \
+    "$uid" "$uid" "$ZID" "$now" "$((now + 300))" | b64url)
+  si="$hdr.$claims"
+  printf '%s.%s' "$si" \
+    "$(printf '%s' "$si" | openssl dgst -sha256 -sign "$PROFILE.pem" | b64url)"
+}
+zitadel_token() {   # raw token response — JSON with access_token, or an error
+  curl -sS -X POST "$ZID/oauth/v2/token" \
+    -d grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer \
+    --data-urlencode "assertion=$(zitadel_jwt)" \
+    --data-urlencode 'scope=openid urn:zitadel:iam:org:project:id:zitadel:aud'
+}
+TOKEN=$(zitadel_token | jq -r .access_token)
+test -n "$TOKEN" && [ "$TOKEN" != null ]   # else: no instance credential, see the fallback below
+```
+
+**1. List who actually holds instance-level rights.** Do not skip this because
+you "know" — the entire point of the incident is that the list contained an
+account nobody had ever heard of:
+
+```bash
+curl -fsS -X POST "$ZID/admin/v1/members/_search" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"query":{"limit":100}}' \
+  | jq -r '.result[] | [.userId, .preferredLoginName, (.roles|join(","))] | @tsv'
+```
+
+A fresh instance answers with exactly three rows: `iam-admin` (machine,
+`IAM_OWNER`, the bootstrap credential from §5.1), `login-client` (machine,
+`IAM_LOGIN_CLIENT`, used by the login UI pod) — and
+`zitadel-admin@zitadel.id.{{ domain }}` (human, `IAM_OWNER`), which nothing in
+this repo asked for. Anything beyond those three on a fresh instance is an
+incident, not a curiosity.
+
+**Fallback — inventory with no ZITADEL credential at all.** This is the version
+that matters after §5.4, when `iam-admin` is gone: the projection table is
+readable straight from Postgres, so you can always answer "who administers this
+instance?" even when you cannot log in. (The ZITADEL pod is distroless and has
+no shell; the Postgres pod does — `exec` into that one.)
+
+```bash
+PGPW=$(kubectl -n zitadel get secret zitadel-db-credentials \
+  -o jsonpath='{.data.postgresPassword}' | base64 -d)
+kubectl -n zitadel exec -i statefulset/zitadel-postgresql -- \
+  env PGPASSWORD="$PGPW" psql -U postgres -d zitadel -At -F'|' -c "
+    SELECT m.user_id,
+           COALESCE(l.login_name, u.username),
+           CASE u.type  WHEN 1 THEN 'human' WHEN 2 THEN 'machine' ELSE '?' END,
+           CASE u.state WHEN 1 THEN 'active'  WHEN 2 THEN 'inactive'
+                        WHEN 3 THEN 'deleted' WHEN 4 THEN 'locked'
+                        WHEN 5 THEN 'suspend' WHEN 6 THEN 'initial' ELSE '?' END,
+           array_to_string(m.roles, ',')
+      FROM projections.instance_members4 m
+      JOIN projections.users14 u
+        ON u.id = m.user_id AND u.instance_id = m.instance_id
+      LEFT JOIN projections.login_names3 l
+        ON l.user_id = m.user_id AND l.instance_id = m.instance_id AND l.is_primary
+     ORDER BY 3, 2;"
+```
+
+The numeric suffixes (`…members4`, `users14`, `login_names3`) are ZITADEL's
+projection versions and change between major releases. If a relation is not
+found, discover the current names first instead of guessing:
+
+```sql
+SELECT table_name FROM information_schema.tables
+ WHERE table_schema = 'projections'
+   AND (table_name LIKE 'instance_members%' OR table_name LIKE 'users%'
+        OR table_name LIKE 'login_names%')
+ ORDER BY table_name;
+```
+
+**2. Change that password now — same session, no "later".**
+
+```bash
+ADMIN_LOGIN="zitadel-admin@zitadel.id.{{ domain }}"
+ADMIN_ID=$(curl -fsS -X POST "$ZID/admin/v1/members/_search" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"query":{"limit":100}}' \
+  | jq -r --arg l "$ADMIN_LOGIN" '.result[]|select(.preferredLoginName==$l)|.userId')
+test -n "$ADMIN_ID"
+
+# Random, and satisfying ZITADEL's default complexity policy (upper/lower/
+# digit/symbol) by construction.
+NEW_PW="$(openssl rand -base64 24 | tr -d '/+=')Aa1!"
+
+curl -fsS -X POST "$ZID/v2/users/$ADMIN_ID/password" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg p "$NEW_PW" '{newPassword:{password:$p,changeRequired:false}}')"
+
+printf 'store this in the password manager NOW: %s\n' "$NEW_PW"
+```
+
+Put it in the password manager **before** you run the verify — it is not
+recoverable, and this account is about to be the instance's only human
+IAM_OWNER (§5.4). Record its login name next to it: the whole failure mode is
+an admin account nobody can name.
+
+**3. Verify — a FAILED login with the default value.** "I changed the password"
+is not a verify. The only evidence that counts is ZITADEL refusing
+`Password1!`. The session API performs a real password check, so it can be
+scripted:
+
+```bash
+probe_password() {   # prints the HTTP status: 201 = this password works
+  curl -s -o /tmp/pwprobe.json -w '%{http_code}' -X POST "$ZID/v2/sessions" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg u "$1" --arg p "$2" \
+          '{checks:{user:{loginName:$u},password:{password:$p}},lifetime:"60s"}')"
+}
+
+# Positive control FIRST — otherwise a typo in the login name gives you a
+# green negative test that proves nothing.
+[ "$(probe_password "$ADMIN_LOGIN" "$NEW_PW")" = "201" ] \
+  || { echo "control failed: the NEW password does not work either — the"; \
+       echo "negative test below would be meaningless. Fix this first."; }
+
+# The actual assertion.
+CODE=$(probe_password "$ADMIN_LOGIN" 'Password1!')
+cat /tmp/pwprobe.json; echo
+[ "$CODE" = "201" ] \
+  && echo "FAIL: the vendor default still authenticates — DO NOT CONTINUE" \
+  || echo "verified: 'Password1!' is rejected (HTTP $CODE)"
+```
+
+A pass is ZITADEL answering with a password-check error (`COMMAND-3M0fs`), not
+an empty body or a `404` — those mean the request never reached the check, and
+the positive control above is what tells the two apart.
+
+Sessions carry `lifetime: 60s` so the probes expire on their own. The default
+lockout policy allows unlimited attempts, so two probes cannot lock the
+account; if you have already tightened it, `_search` the lockout policy first.
+
+**4. Optional but recommended:** once §5.4 has given *your own* account
+IAM_OWNER, deactivate this one — an admin account with no owner is a liability
+even with a good password:
+
+```bash
+curl -fsS -X POST "$ZID/v2/users/$ADMIN_ID/deactivate" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}'
+```
+
+Do **not** do this before §5.4 succeeds: right now it is the only human
+IAM_OWNER that exists.
+
+### 5.3 Apply the bootstrap
+
+If OpenTofu is not on the server yet:
+
+```bash
+curl -fsSL https://get.opentofu.org/install-opentofu.sh -o /tmp/install-opentofu.sh
+chmod +x /tmp/install-opentofu.sh && /tmp/install-opentofu.sh --install-method standalone
+```
+
+> The installer needs `unzip` and `gnupg` (§0). Without them it exits 1 after
+> printing a single line — `Unzip is missing, please install it to use the
+> standalone installation method.` — and nothing else. Run from a background
+> job or a script, all you see is "exit code 1"; do not go hunting elsewhere,
+> just install the packages from §0.
+
+```bash
+tofu init && tofu apply    # provider reads ./service-user.json
 ```
 
 **Verify:**
 
 ```bash
+tofu version                               # installer worked
 tofu output -raw admin_initial_password    # read once, store in password manager
+tofu output -raw admin_user_id             # needed for the §5.4 gate
 ```
+
+### 5.4 Revoke the credential (mandatory — and only once §5.4.0 holds)
+
+#### 5.4.0 Precondition: a verified human IAM_OWNER must already exist
+
+Revoking `iam-admin` removes the **last instance-level credential** unless a
+human one already exists. The account tofu just created (`admin.tf`) is an
+**`ORG_OWNER`, and `ORG_OWNER` is not enough**: it administers the community
+org and gets a flat `403` on `/admin/v1/*`. That is not a corner case you can
+postpone — the following all live at instance level and cannot be done by any
+`ORG_OWNER`:
+
+- **SMTP / notification providers** (`/admin/v1/smtp/...`) — without them
+  ZITADEL sends no mail at all: no invitations, no password resets, no
+  verification codes;
+- **login and password policies, lockout, MFA enforcement** as instance
+  defaults;
+- **instance-wide external IdPs** (Google, OIDC) and the login-v2 feature flags
+  (`patterns/zitadel-external-idp/`, `patterns/zitadel-login-v2/`);
+- **creating further organisations**, instance domains, and
+- **appointing further instance administrators** — including the way back out
+  of this hole.
+
+Get this wrong and nothing breaks today. It breaks in six weeks, the first time
+someone tries to configure SMTP, and by then the credential that could have
+fixed it is shredded.
+
+**Recommended: give the account you actually use instance rights**, so the
+instance administrator is a person with a name rather than the anonymous
+default account from §5.2:
+
+```bash
+ADMIN_USER_ID=$(tofu output -raw admin_user_id)     # from §5.3
+curl -fsS -X POST "$ZID/admin/v1/members" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg u "$ADMIN_USER_ID" '{userId:$u,roles:["IAM_OWNER"]}')"
+```
+
+**Gate — all three must hold before you continue. Do not revoke otherwise:**
+
+```bash
+# (a) read the list and pick the HUMAN instance administrator you will keep.
+#     iam-admin and login-client are MACHINES — they do not satisfy this gate.
+curl -fsS -X POST "$ZID/admin/v1/members/_search" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"query":{"limit":100}}' \
+  | jq -r '.result[] | [.preferredLoginName, (.roles|join(","))] | @tsv'
+
+HUMAN_LOGIN='admin@…'      # ← from that list, an account you can name
+KNOWN_PW='…'               # ← its password: §5.2's $NEW_PW, or
+                           #    `tofu output -raw admin_initial_password`
+
+# (b) you really hold a working password for it — generated for THIS instance,
+#     never a value out of any vendor's documentation
+[ "$(probe_password "$HUMAN_LOGIN" "$KNOWN_PW")" = "201" ] \
+  && echo "human IAM_OWNER verified" \
+  || echo "FAIL: you do not actually hold a working human IAM_OWNER password"
+
+# (c) no vendor default authenticates anywhere (inv. 9)
+[ "$(probe_password "zitadel-admin@zitadel.id.{{ domain }}" 'Password1!')" = "201" ] \
+  && echo "FAIL: §5.2 did not take — DO NOT REVOKE" \
+  || echo "gate clear"
+```
+
+`probe_password` is the helper from §5.2. If (a) or (b) fails, fix it **now**,
+while `iam-admin` still works — after the revocation there is no route back
+except a chart upgrade that re-runs the setup job.
+
+#### 5.4.1 Revoke, prove, then destroy
+
+**Order matters: revoke → prove the revocation while you still hold the key →
+destroy the key material last.** Destroying the JWT profile first (the obvious
+order) leaves you with two HTTP 200s and no way to test anything: you can no
+longer authenticate, so you cannot tell a revoked credential from a working
+one. The error direction here is asymmetric — a revocation that silently did
+not take leaves a **valid IAM-owner credential** in the instance, and nobody
+finds out. Do not continue past a failing verify in this step.
+
+The `zitadel_jwt` / `zitadel_token` helpers are the ones defined in §5.2.
+
+**1. Revoke the key and deactivate the machine user:**
+
+```bash
+TOKEN=$(zitadel_token | jq -r .access_token)
+USER_ID=$(jq -r .userId "$PROFILE"); KEY_ID=$(jq -r .keyId "$PROFILE")
+curl -fsS -X DELETE "$ZID/management/v1/users/$USER_ID/keys/$KEY_ID" \
+  -H "Authorization: Bearer $TOKEN"
+curl -fsS -X POST "$ZID/management/v1/users/$USER_ID/_deactivate" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Both answer HTTP 200 with a ZITADEL change sequence. **Two 200s are not
+proof** — they say the API accepted the calls, not that the credential is dead.
+(Same thing via console: Instance → Users → Service Users → `iam-admin` → Keys
+→ delete, then deactivate the user. The negative test below is required either
+way.)
+
+**2. Verify — negative test, run it while the JWT profile still exists:**
+
+```bash
+zitadel_token                        # read it: must be an error, not a token
+zitadel_token | jq -e 'has("access_token")' >/dev/null \
+  && echo "FAIL: revoked credential still mints tokens — DO NOT CONTINUE" \
+  || echo "revocation verified: the credential can no longer authenticate"
+```
+
+Read the first line, do not just run it: an empty response or an HTML error
+page also takes the "verified" branch, and that proves nothing — it means the
+request never reached ZITADEL. A pass is ZITADEL answering with an OAuth error
+(`invalid_grant` / key not found).
+
+If it still mints an `access_token`: **stop**. The revocation did not take —
+re-check that you targeted the right `userId`/`keyId`, repeat step 1, and do
+**not** destroy the profile in the meantime. It is the only thing that lets you
+test again.
+
+**3. Only now destroy the key material:**
+
+```bash
+shred -u "$PROFILE" "$PROFILE.pem" 2>/dev/null || rm -f "$PROFILE" "$PROFILE.pem"
+kubectl -n zitadel delete secret iam-admin
+```
+
+**Verify:**
+
+```bash
+test ! -e "$PROFILE" && test ! -e "$PROFILE.pem" && echo "local credential gone"
+kubectl -n zitadel get secret iam-admin   # → Error ... "iam-admin" not found
+```
+
+A later ZITADEL chart upgrade re-runs the setup job and may recreate
+`zitadel/iam-admin` — check for it after every upgrade and delete it again.
+That is also the way back to a bootstrap credential if you ever need §5.1
+again. If the secret is gone and no setup job will run (rebuild case), mint an
+operator service-user PAT in the console instead — `tofu/zitadel/README.md`.
 
 Log in at `https://id.{{ domain }}` as `admin` with that password (forced
 change on first login), then do all further identity work via the console /
 API — `runbooks/zitadel-identity-via-api.md`.
+
+### 5.5 Hand over an administrator list, not an assumption
+
+The bootstrap is only finished when you can **name every account with
+instance-level rights**, with its type and state. Re-run the inventory from
+§5.2 — after the revocation the Postgres route is the one that still works —
+and put its output in the handover:
+
+```
+<id>|admin@<org>.{{ domain }}|human|active|IAM_OWNER
+<id>|zitadel-admin@zitadel.id.{{ domain }}|human|inactive|IAM_OWNER
+<id>|iam-admin|machine|inactive|IAM_OWNER
+<id>|login-client|machine|active|IAM_LOGIN_CLIENT
+```
+
+Anything on that list you cannot explain is an incident. Repeat the inventory
+after **every ZITADEL chart upgrade**: a re-run setup job recreates
+`zitadel/iam-admin`, and a new instance would recreate the default human too
+(invariant 9).
 
 ## 6. ForwardAuth front door (optional but recommended)
 
@@ -443,13 +1013,36 @@ tls-san:
 
 ```bash
 sudo systemctl restart k3s
-sudo ufw allow 6443/tcp comment 'k3s API for GitHub Actions OIDC'
-sudo ufw reload
 ```
 
-Source `Anywhere` is acceptable: GitHub's runner IPs rotate and the API
-enforces OIDC auth — unauthenticated requests get 401. If this rule is
-missing, CI deploys fail with `dial tcp {{ server_ipv4 }}:6443: i/o timeout`.
+Then open 6443 — **in the §1.2 nft guard, which is what actually filters on
+this node.** `ufw allow 6443/tcp` does nothing here (§1.2): k3s's chains run
+before ufw's, so the port was never closed by ufw in the first place and the
+rule only creates the impression of a deliberate exception. Edit
+`/etc/nftables.d/k3sguard.nft` and accept 6443 *above* the drop rule:
+
+```nft
+        tcp dport 6443 accept
+        tcp dport { 10248, 10249, 10250, 10256, 10257, 10258, 10259 } drop
+```
+
+```bash
+sudo nft -f /etc/nftables.conf
+```
+
+**Verify from an external host** (see the two traps in §1.2 — a proxied scan
+reports everything open):
+
+```bash
+nc -vz -w3 {{ server_ipv4 }} 6443    # now open
+nc -vz -w3 {{ server_ipv4 }} 10250   # still closed — only 6443 was punched
+```
+
+Source `Anywhere` is acceptable for 6443: GitHub's runner IPs rotate and the
+API enforces OIDC auth — unauthenticated requests get 401. It is acceptable
+for **6443 only**; 10250 and 8472 stay closed, they have no such
+authentication in front of them. If the hole is missing, CI deploys fail with
+`dial tcp {{ server_ipv4 }}:6443: i/o timeout`.
 
 CI identities authenticate as
 `https://token.actions.githubusercontent.com#repo:<owner>/<repo>:<ref>`. Bind

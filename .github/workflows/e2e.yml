@@ -317,6 +317,100 @@ jobs:
           cat /tmp/oidc.json
           jq -e '.issuer == "https://id.testville.example"' /tmp/oidc.json
 
+      # Executable form of runbooks/bootstrap-from-zero.md §5.2 and of
+      # invariant 9. ZITADEL creates a HUMAN IAM_OWNER from its own published
+      # defaults when FirstInstance.Org.Human is omitted (which the template
+      # does on purpose, to keep a plaintext password out of git):
+      # zitadel-admin@zitadel.<domain> / Password1!, active, on the open
+      # internet. An omitted config value yields the VENDOR's default, not
+      # "no user" — runbooks/incidents/zitadel-default-admin.md.
+      # This step runs BEFORE "Identity as code" because it needs the
+      # iam-admin credential that step later revokes, mirroring the runbook.
+      - name: Smoke — no instance admin accepts a vendor default password (inv. 9)
+        run: |
+          set -uo pipefail
+          ZID=https://id.testville.example
+          CACERT=/tmp/pebble-root.pem
+          PROFILE=/tmp/iam-admin.json
+          ADMIN_LOGIN="zitadel-admin@zitadel.id.testville.example"
+
+          kubectl -n zitadel get secret iam-admin \
+            -o jsonpath='{.data.iam-admin\.json}' | base64 -d > "$PROFILE"
+
+          # JWT-bearer auth with the chart's machine key — same dance as §5.2.
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now=$(date +%s)
+          kid=$(jq -r .keyId "$PROFILE"); uid=$(jq -r .userId "$PROFILE")
+          jq -r .key "$PROFILE" > "$PROFILE.pem"
+          hdr=$(printf '{"alg":"RS256","typ":"JWT","kid":"%s"}' "$kid" | b64url)
+          claims=$(printf '{"iss":"%s","sub":"%s","aud":"%s","iat":%s,"exp":%s}' \
+            "$uid" "$uid" "$ZID" "$now" "$((now + 300))" | b64url)
+          si="$hdr.$claims"
+          JWT="$si.$(printf '%s' "$si" | openssl dgst -sha256 -sign "$PROFILE.pem" | b64url)"
+          TOKEN=$(curl -sS --cacert "$CACERT" -X POST "$ZID/oauth/v2/token" \
+            -d grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer \
+            --data-urlencode "assertion=$JWT" \
+            --data-urlencode 'scope=openid urn:zitadel:iam:org:project:id:zitadel:aud' \
+            | jq -r .access_token)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = null ]; then
+            echo "FAIL: could not authenticate with the iam-admin JWT profile"; exit 1
+          fi
+
+          members() {
+            curl -fsS --cacert "$CACERT" -X POST "$ZID/admin/v1/members/_search" \
+              -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+              -d '{"query":{"limit":100}}'
+          }
+          probe() {   # $1 login, $2 password -> HTTP status; 201 = it works
+            curl -s --cacert "$CACERT" -o /tmp/pwprobe.json -w '%{http_code}' \
+              -X POST "$ZID/v2/sessions" \
+              -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg u "$1" --arg p "$2" \
+                    '{checks:{user:{loginName:$u},password:{password:$p}},lifetime:"60s"}')"
+          }
+
+          echo "=== instance administrators (the list nobody looked at) ==="
+          members | jq -r '.result[] | [.userId, .preferredLoginName, (.roles|join(","))] | @tsv'
+
+          ADMIN_ID=$(members | jq -r --arg l "$ADMIN_LOGIN" \
+            '.result[]|select(.preferredLoginName==$l)|.userId')
+          if [ -z "$ADMIN_ID" ]; then
+            echo "note: $ADMIN_LOGIN not present — upstream defaults changed."
+            echo "The assertion below still covers every instance administrator."
+          else
+            echo "default admin exists: $ADMIN_ID ($ADMIN_LOGIN)"
+            echo "vendor default accepted BEFORE remediation: HTTP $(probe "$ADMIN_LOGIN" 'Password1!')"
+            # Remediation, exactly as the runbook prescribes (§5.2 step 2).
+            NEW_PW="$(openssl rand -base64 24 | tr -d '/+=')Aa1!"
+            curl -fsS --cacert "$CACERT" -X POST "$ZID/v2/users/$ADMIN_ID/password" \
+              -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg p "$NEW_PW" \
+                    '{newPassword:{password:$p,changeRequired:false}}')" > /dev/null
+            # Positive control: without it, a typo in the login name would make
+            # the negative assertion below pass for the wrong reason.
+            CTRL=$(probe "$ADMIN_LOGIN" "$NEW_PW")
+            if [ "$CTRL" != "201" ]; then
+              echo "FAIL: positive control failed (HTTP $CTRL) — the negative"
+              echo "assertion below would prove nothing."; cat /tmp/pwprobe.json; exit 1
+            fi
+            echo "positive control ok: the new password authenticates"
+          fi
+
+          # The assertion: no instance administrator authenticates with a
+          # password out of any vendor's documentation.
+          rc=0
+          while read -r login; do
+            [ -n "$login" ] || continue
+            for pw in 'Password1!' 'Password1' 'admin' 'zitadel' 'Password!1'; do
+              if [ "$(probe "$login" "$pw")" = "201" ]; then
+                echo "FAIL: $login accepts the vendor default password '$pw'"
+                rc=1
+              fi
+            done
+          done < <(members | jq -r '.result[].preferredLoginName')
+          if [ "$rc" -ne 0 ]; then exit 1; fi
+          echo "verified: no instance administrator accepts a known vendor default"
+
       - name: Identity as code (tofu apply against CI ZITADEL)
         run: |
           kubectl create namespace terraform-state

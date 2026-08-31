@@ -259,6 +259,12 @@ Useful side effects:
 - **Guardrails are enforced, not just documented:** the `cluster-admin` policy
   (invariant #1) is exercised — CI asserts a forbidden binding is rejected at
   admission time.
+- **Vendor defaults cannot survive a bootstrap:** CI enumerates the ZITADEL
+  *instance* administrators, performs the runbook's remediation, and then fails
+  the build if any of them still authenticates with a documented default
+  password (`Password1!` & co.). A regression in the runbook — or an upstream
+  change that reintroduces a default credential — breaks the build instead of a
+  production instance (`runbooks/incidents/zitadel-default-admin.md`).
 
 **What CI honestly cannot cover:** the `curl | sh` k3s install itself, systemd
 configuration, hostPort binding on a real NIC, real DNS + Let's Encrypt rate
@@ -318,6 +324,10 @@ These apply to every instance and every agent that touches the stack:
   operator credential, the registry pull credential for private images) live
   only in the cluster — never committed, not even sealed. Never commit
   plaintext.
+- **No vendor default credential survives its bootstrap** — and the obligation
+  is to *enumerate the accounts that exist*, not to assume you know them. An
+  omitted configuration value does not produce nothing; it produces the
+  vendor's default, and vendor defaults are published. Asserted in CI.
 - **Build multi-arch** when the target node is ARM64.
 - **ZITADEL = IdP, not CRM.** Domain data belongs in app databases.
 - **Identity is declarative** (OpenTofu), not UI clicks.
