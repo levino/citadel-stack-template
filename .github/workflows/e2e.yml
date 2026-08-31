@@ -51,7 +51,7 @@ jobs:
             "$DERIVATIVE"/argocd/applications/*.yaml
           # zitadel/ references sealed secrets that only exist after sealing
           # against a live cluster — validate the build with placeholders.
-          for name in masterkey db-credentials; do
+          for name in masterkey first-admin db-credentials; do
             cat > "$DERIVATIVE/zitadel/sealed-zitadel-$name.yaml" <<EOF
           apiVersion: bitnami.com/v1alpha1
           kind: SealedSecret
@@ -318,12 +318,13 @@ jobs:
           jq -e '.issuer == "https://id.testville.example"' /tmp/oidc.json
 
       # Executable form of runbooks/bootstrap-from-zero.md §5.2 and of
-      # invariant 9. ZITADEL creates a HUMAN IAM_OWNER from its own published
-      # defaults when FirstInstance.Org.Human is omitted (which the template
-      # does on purpose, to keep a plaintext password out of git):
-      # zitadel-admin@zitadel.<domain> / Password1!, active, on the open
-      # internet. An omitted config value yields the VENDOR's default, not
-      # "no user" — runbooks/incidents/zitadel-default-admin.md.
+      # invariant 9 + 6b. ZITADEL creates a HUMAN IAM_OWNER whenever
+      # FirstInstance.Org.Human is not fully specified — an omitted config value
+      # yields the VENDOR's default, not "no user"
+      # (runbooks/incidents/zitadel-default-admin.md). The template therefore
+      # supplies a RANDOM password for that account instead of leaving the field
+      # empty, and this step asserts that 'Password1!' never authenticates —
+      # not after remediation, and not before it either.
       # This step runs BEFORE "Identity as code" because it needs the
       # iam-admin credential that step later revokes, mirroring the runbook.
       - name: Smoke — no instance admin accepts a vendor default password (inv. 9)
@@ -379,7 +380,18 @@ jobs:
             echo "The assertion below still covers every instance administrator."
           else
             echo "default admin exists: $ADMIN_ID ($ADMIN_LOGIN)"
-            echo "vendor default accepted BEFORE remediation: HTTP $(probe "$ADMIN_LOGIN" 'Password1!')"
+            # The account exists — but its password is random
+            # (ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD, SealedSecret
+            # zitadel-first-admin). Assert that rather than merely observe it:
+            # this is what stops a future change from silently reintroducing
+            # the vendor default.
+            PRE=$(probe "$ADMIN_LOGIN" 'Password1!')
+            if [ "$PRE" = "201" ]; then
+              echo "FAIL: $ADMIN_LOGIN accepts the vendor default 'Password1!'"
+              echo "ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD did not take."
+              exit 1
+            fi
+            echo "vendor default rejected from the start (HTTP $PRE)"
             # Remediation, exactly as the runbook prescribes (§5.2 step 2).
             NEW_PW="$(openssl rand -base64 24 | tr -d '/+=')Aa1!"
             curl -fsS --cacert "$CACERT" -X POST "$ZID/v2/users/$ADMIN_ID/password" \

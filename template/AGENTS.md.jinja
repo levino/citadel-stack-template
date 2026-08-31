@@ -104,7 +104,15 @@ Read this file first. For any non-trivial operation there is a runbook:
    forbidden is a *standing* admin credential in the cluster or on disk, not
    its one-shot bootstrap use. See `tofu/zitadel/README.md` and
    `runbooks/zitadel-identity-via-api.md`.
-7. **ZITADEL is an IdP, not a CRM.** Domain data (fees, join dates,
+6b. **No account is ever created with a vendor's documented password.** Not
+     briefly, not "it is changed right afterwards", not in CI. Either no
+     password at all or a random one nobody knows — a value printed in a
+     vendor's own repository is not a secret. Where a chart or image would
+     insert such a default, supply the value explicitly and randomly
+     (`ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD` from the SealedSecret
+     `zitadel-first-admin`). Leaving the field empty is what *causes* the
+     default. Asserted in CI.
+  7. **ZITADEL is an IdP, not a CRM.** Domain data (fees, join dates,
    membership numbers) belongs in app databases, keyed by the token `sub`.
 8. **Single node, single replica is a feature** (cheap infra). Do not add
    HA machinery.

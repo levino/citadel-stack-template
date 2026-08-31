@@ -41,6 +41,21 @@ spec:
               secretKeyRef:
                 name: zitadel-db-credentials
                 key: postgresPassword
+          # Password of the first human. WITHOUT this variable ZITADEL falls
+          # back to its documented default `Password1!`
+          # (cmd/setup/steps.yaml, ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD) and
+          # creates an immediately usable IAM_OWNER account whose password is
+          # published in the vendor's own repository. The value here is random,
+          # from the SealedSecret zitadel-first-admin
+          # (scripts/seal-zitadel-secrets.sh) — nobody knows it, and nobody needs
+          # to: §5.3 creates the administrator you actually use.
+          - name: ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: zitadel-first-admin
+                key: password
+          - name: ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED
+            value: "true"
           # Login v2 as system-wide default — `/` then redirects to /ui/v2/login
           # instead of the legacy login UI.
           - name: ZITADEL_FEATURES_LOGINV2_REQUIRED
@@ -81,15 +96,17 @@ spec:
             # right after the apply (tofu/zitadel/README.md step 4). It must
             # never stay in the cluster as a standing credential.
             #
-            # FirstInstance.Org.Human is deliberately NOT set here — a plaintext
-            # password must never sit in this repo. Do NOT read that as "no
-            # human admin is created": ZITADEL falls back to its own published
-            # defaults and creates
+            # FirstInstance.Org.Human is not spelled out here — a plaintext
+            # password must never sit in this repo. But an omitted value does not
+            # yield nothing, it yields the VENDOR's default: ZITADEL would create
             #     zitadel-admin@zitadel.id.{{ domain }} / Password1!  (IAM_OWNER, active)
-            # An omitted value yields the VENDOR's default, not nothing. That
-            # password MUST be changed in the same session as the deploy, and
-            # the change proven with a failed login — runbooks/bootstrap-from-zero.md
-            # §5.2, runbooks/incidents/zitadel-default-admin.md, AGENTS.md inv. 9.
+            # with a password printed in its own documentation.
+            #
+            # The password is therefore supplied as a RANDOM value through
+            # ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD above (SealedSecret
+            # zitadel-first-admin). The account still exists, but nobody — least
+            # of all a reader of this repo — can log in as it. Verified in
+            # runbooks/bootstrap-from-zero.md §5.2; AGENTS.md inv. 9.
             # Setting it here instead would only move the problem into git.
 
         replicaCount: 1
