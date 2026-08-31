@@ -592,9 +592,32 @@ tofu init && tofu apply    # provider reads ./service-user.json
 
 ```bash
 tofu version                               # installer worked
-tofu output -raw admin_initial_password    # read once, store in password manager
-tofu output -raw admin_user_id             # needed for the §5.4 gate
+tofu output org_id                         # the community org exists
 ```
+
+**`tofu apply` creates no people.** It builds the org, one project per
+association, the roles those projects assert, and the ForwardAuth OIDC client —
+structure, nothing else. Users, memberships and role grants are made by hand and
+must never enter this configuration: Terraform reconciles, so anything present in
+ZITADEL but absent here is deleted on the next apply.
+
+**Create your human administrator now** — the §5.4 gate depends on it and
+nothing creates it for you:
+
+1. In the ZITADEL console (logged in as the account from §5.2), create your own
+   user, verify its e-mail, and set a password you hold.
+2. Note its user id — the console shows it, or read it from the projection:
+
+   ```bash
+   PGPW=$(kubectl -n zitadel get secret zitadel-db-credentials \
+     -o jsonpath='{.data.postgresPassword}' | base64 -d)
+   kubectl -n zitadel exec -i statefulset/zitadel-postgresql -- \
+     env PGPASSWORD="$PGPW" psql -U postgres -d zitadel -At -F'|' \
+     -c "SELECT id, username FROM projections.users14 ORDER BY username;"
+   ```
+
+3. Log in with it once, for real. An account you have not logged into is not a
+   verified administrator.
 
 ### 5.4 Revoke the credential (mandatory — and only once §5.4.0 holds)
 
@@ -627,7 +650,7 @@ instance administrator is a person with a name rather than the anonymous
 default account from §5.2:
 
 ```bash
-ADMIN_USER_ID=$(tofu output -raw admin_user_id)     # from §5.3
+ADMIN_USER_ID='…'                                  # the human you created in §5.3
 curl -fsS -X POST "$ZID/admin/v1/members" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "$(jq -n --arg u "$ADMIN_USER_ID" '{userId:$u,roles:["IAM_OWNER"]}')"
@@ -644,8 +667,8 @@ curl -fsS -X POST "$ZID/admin/v1/members/_search" \
   | jq -r '.result[] | [.preferredLoginName, (.roles|join(","))] | @tsv'
 
 HUMAN_LOGIN='admin@…'      # ← from that list, an account you can name
-KNOWN_PW='…'               # ← its password: §5.2's $NEW_PW, or
-                           #    `tofu output -raw admin_initial_password`
+KNOWN_PW='…'               # ← its password: the one you set in §5.3 and
+                           #    have logged in with at least once
 
 # (b) you really hold a working password for it — generated for THIS instance,
 #     never a value out of any vendor's documentation
@@ -753,6 +776,38 @@ Anything on that list you cannot explain is an incident. Repeat the inventory
 after **every ZITADEL chart upgrade**: a re-run setup job recreates
 `zitadel/iam-admin`, and a new instance would recreate the default human too
 (invariant 9).
+
+## 5.6 From here on ZITADEL is managed by hand
+
+**ZITADEL is created once. After that the console is the truth, not this repo.**
+Organizations, users, roles, SMTP, identity providers — all of it is made and
+changed by hand, and nothing may later remove it. What stays declarative is only
+the **existence**: deployment, database, masterkey, ingress.
+
+Two mechanisms have to be held back for that, and both are configured that way
+in this template:
+
+- The `zitadel`, `zitadel-base` and `zitadel-postgresql` Applications run
+  **without `automated`**. Argo still reports drift as `OutOfSync`, but does not
+  act. Sync only on purpose, and read the diff first — a sync after a chart
+  upgrade re-runs the setup job, which reaches into `FirstInstance` again.
+
+  ```bash
+  kubectl -n argocd patch application zitadel --type merge -p '{"operation":{"sync":{}}}'
+  ```
+
+- **`tofu/zitadel/` is not applied again.** It manages structure, but Terraform
+  reconciles: on a running instance the first plan is a delete plan for
+  everything created by hand. Re-adopting it requires `tofu import` first.
+
+**Where the line runs:** git derives the *infrastructure* — deployment,
+database, masterkey, ingress. It never held the *content*: organizations, users,
+roles, SMTP. That was never the claim and should not become one — personal data
+does not belong in a repository.
+
+The content lives in Postgres, which is what makes a **database backup** the
+thing that matters here, not more IaC. A rebuild restores the infrastructure
+from git and the content from that backup.
 
 ## 6. ForwardAuth front door (optional but recommended)
 

@@ -1,10 +1,17 @@
-# NOTE (invariant 6): identity CONTENT — projects, roles and especially user
-# grants (who is in which role) — is API-managed at runtime, NOT in tofu/git
-# (GDPR + churn; see README.md). The project/role scaffolding below is a
-# convenience for the *initial* bootstrap and the CI harness only; do NOT add
-# user grants / memberships here. Real membership work happens via the ZITADEL
-# API/console — see runbooks/zitadel-identity-via-api.md. `managers` stays
-# empty in git on a real instance.
+# NOTE (invariant 6): PEOPLE ARE NOT MANAGED HERE — not users, not their
+# memberships, not their role grants. Only *structure* is: the org, one project
+# per association, and the roles those projects can assert.
+#
+# The reason is not tidiness. Terraform reconciles: whatever exists in ZITADEL
+# but not in this configuration is DELETED on the next apply. Every account
+# created by hand and every membership granted in the console would be removed
+# by an apply nobody thought was destructive. On a running instance the first
+# plan is a delete plan.
+#
+# People are created and granted in the ZITADEL console or through its API —
+# see runbooks/zitadel-identity-via-api.md. There is deliberately no escape
+# hatch here: an earlier version carried a `managers` map for delegated admins,
+# and a map you may fill is a map someone eventually fills.
 #
 # The identity model: one org = the community (shared identity pool),
 # one project per association, roles per project. See README.md.
@@ -21,12 +28,6 @@ module "community" {
     },
 {% endfor %}
   ]
-
-  # Delegated administration: map association name -> list of ZITADEL user
-  # IDs that become PROJECT_OWNER (self-service for their own members).
-  # Filled in as people join, e.g.:
-  #   managers = { "sports-club" = ["123456789012345678"] }
-  managers = {}
 }
 
 output "org_id" {

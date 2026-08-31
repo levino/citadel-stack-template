@@ -34,15 +34,6 @@ locals {
       }
     ]
   ])
-
-  managers = flatten([
-    for association, user_ids in var.managers : [
-      for user_id in user_ids : {
-        association = association
-        user_id     = user_id
-      }
-    ]
-  ])
 }
 
 # Roles per project — asserted into tokens as claims.
@@ -53,15 +44,4 @@ resource "zitadel_project_role" "role" {
   project_id   = zitadel_project.association[each.value.association].id
   role_key     = each.value.role
   display_name = each.value.role
-}
-
-# Boards as project managers: self-service for their own members, no access
-# to anything else.
-resource "zitadel_project_member" "manager" {
-  for_each = { for m in local.managers : "${m.association}/${m.user_id}" => m }
-
-  org_id     = zitadel_org.community.id
-  project_id = zitadel_project.association[each.value.association].id
-  user_id    = each.value.user_id
-  roles      = ["PROJECT_OWNER"]
 }

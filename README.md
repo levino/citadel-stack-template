@@ -59,7 +59,7 @@ Internet :80/:443
 | **sealed-secrets** | secrets in git | encryptable offline against a public key |
 | **Argo CD** | GitOps reconciler | the repo is the single source of truth; native PR previews (ApplicationSet) |
 | **ZITADEL** | identity provider | org/project/role + delegated admins + self-service |
-| **OpenTofu** | identity as code | orgs, projects, OIDC clients declaratively |
+| **OpenTofu** | identity *structure* as code | orgs, projects, roles, OIDC clients — **never users or memberships**, those are made by hand and would be deleted by the next apply |
 | **GitHub Actions + OIDC** | deploy pipeline | no stored kubeconfig secret |
 
 **Deliberate limits:** single node, single replica. No HA. That is a *feature*
@@ -287,7 +287,7 @@ agentops-community-stack/
     ├── AGENTS.md.jinja        # agent contract: invariants + runbooks (see below)
     ├── argocd/                # GitOps entry point: AppProject + root "app of apps" + child Applications
     ├── cluster/               # substrate: cert-manager, sealed-secrets, rbac, policy
-    ├── tofu/zitadel/          # identity as code
+    ├── tofu/zitadel/          # identity STRUCTURE as code (no people)
     │   └── modules/community/ # reusable "org = community, project = club" module
     ├── patterns/              # copyable recipes
     │   ├── app-native-oidc/   # app as OIDC client
