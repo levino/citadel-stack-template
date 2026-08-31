@@ -88,25 +88,26 @@ Synced/Healthy). Fully scriptable, no console step:
    tofu apply
    ```
 
-   Read the admin's initial password once:
+   This creates **structure only** — the org, one project per association, the
+   roles those projects assert, and the ForwardAuth OIDC client. It creates no
+   people; see the note at the top of this file.
+
+5. **Create your human administrator by hand — before step 6.** Nothing in this
+   directory does it for you any more. Create the account in the ZITADEL console
+   (or via the API with the bootstrap credential), set a password you actually
+   hold, then grant it `IAM_OWNER` at instance level. `ORG_OWNER` is not enough:
+   it gets `403` on `/admin/v1/*`, so no SMTP provider, no instance
+   login/password policy, no instance-wide external IdP, no further orgs, no
+   further instance admins.
 
    ```bash
-   tofu output -raw admin_initial_password
-   ```
-
-5. **Give a human account instance rights — before step 6.** The user created
-   here is an **`ORG_OWNER`**, which is *not* an instance administrator: it
-   gets `403` on `/admin/v1/*`, so no SMTP provider, no instance login/password
-   policy, no instance-wide external IdP, no further orgs, no further instance
-   admins. Grant it `IAM_OWNER` at instance level while the bootstrap
-   credential still works:
-
-   ```bash
+   USER_ID='…'   # the account you just created and logged into
    curl -fsS -X POST "https://id.<domain>/admin/v1/members" \
      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-     -d "$(jq -n --arg u "$(tofu output -raw admin_user_id)" \
-           '{userId:$u,roles:["IAM_OWNER"]}')"
+     -d "$(jq -n --arg u "$USER_ID" '{userId:$u,roles:["IAM_OWNER"]}')"
    ```
+
+   Full procedure with the verification: `runbooks/bootstrap-from-zero.md` §5.3.
 
 6. **Revoke the credential — mandatory, and in this order:** first confirm that
    a **human** `IAM_OWNER` exists whose (non-default) password you actually

@@ -15,19 +15,3 @@ variable "associations" {
     are modeled as role conventions ("football:board"), not trees.
   EOT
 }
-
-variable "managers" {
-  type        = map(list(string))
-  default     = {}
-  description = <<-EOT
-    Delegated administration: association name -> list of ZITADEL user IDs
-    that become PROJECT_OWNER of that association's project. A project owner
-    assigns existing community users to the project's roles in self-service —
-    without access to any other association.
-  EOT
-
-  validation {
-    condition     = alltrue([for k, v in var.managers : contains([for a in var.associations : a.name], k)])
-    error_message = "Every key in managers must be the name of an association."
-  }
-}

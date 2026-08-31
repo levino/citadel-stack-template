@@ -87,7 +87,13 @@ Read this file first. For any non-trivial operation there is a runbook:
    not committed as code. Two reasons: (a) **GDPR** — personal membership
    data must never live in version control (it is hard to delete, gets
    replicated, persists in history); (b) it changes far too often for a code
-   loop. `tofu/zitadel/` holds at most the bare instance/org bootstrap. The
+   loop; (c) Terraform **reconciles** — anything present in ZITADEL but absent
+     from the configuration is deleted on the next apply, so a single
+     `tofu apply` would wipe out every account and grant made by hand.
+     `tofu/zitadel/` therefore carries **structure only** — org, projects,
+     roles, OIDC clients — and no users, memberships or role grants; on a
+     running instance it is not applied again at all
+     (`runbooks/bootstrap-from-zero.md` §5.6). The
    API credential is passed **per session** and is **never committed** and
    **never left standing** — the bootstrap uses the chart's `iam-admin` JWT
    profile once and then deletes the secret and revokes the key
@@ -137,7 +143,7 @@ Read this file first. For any non-trivial operation there is a runbook:
 | `cluster/` | substrate: cert-manager, sealed-secrets, rbac, policy (cluster-admin guardrail) | Argo CD (Application `cluster`) |
 | `zitadel/` | ZITADEL namespace + sealed bootstrap secrets (ZITADEL/Postgres are Helm Applications) | Argo CD (Application `zitadel-base` — OutOfSync until secrets are sealed) |
 | `apps/` | one entry per app — stamped by `scripts/new-app.sh` | Argo CD (Application `apps`) |
-| `tofu/zitadel/` | ZITADEL **bootstrap only** (instance/org); identity content is API-managed (inv. 6) | `tofu apply` (local), once |
+| `tofu/zitadel/` | ZITADEL **structure only** (org, projects, roles, OIDC clients) — never users or memberships (inv. 6). Not re-applied on a running instance (§5.6) | `tofu apply` (local), once |
 | `patterns/` | copyable recipes: native OIDC, ForwardAuth, PR previews, login v2, external IdP, role→groups, oauth2-proxy+nginx, public/protected sites, app deploy CI | read, copy, adapt |
 | `runbooks/` | bootstrap, Argo CD GitHub App, ZITADEL-via-API, incidents | read |
 
