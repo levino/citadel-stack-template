@@ -10,7 +10,7 @@ This is the counterpart to the cluster-side wiring: `new-app.sh` gives Argo CD a
 pattern is what populates the image tag there.
 
 **Invariants this honors:** no stored kubeconfig, no `kubectl` in CI, no
-`id-token` for the cluster (inv. 1 + 2); native-arch builds, never QEMU (inv. 4).
+`id-token` for the cluster (inv. 1 + 2); native-arch builds, never QEMU (inv. 5).
 
 In the snippets below replace `<owner>` (your GitHub owner, `{{ github_owner }}`)
 and `<app>` with the app's name.
@@ -20,7 +20,8 @@ and `<app>` with the app's name.
 ```
 deploy/overlays/production/
   kustomization.yaml      # resources + an images: block CI rewrites
-  deployment.yaml         # image: ghcr.io/<owner>/<app>  (bare, no tag)
+  deployment.yaml         # image: ghcr.io/<owner>/<app> (bare, no tag)
+                          # + imagePullSecrets: [{ name: ghcr-pull }]
   service.yaml
   ingress.yaml            # cert-manager.io/cluster-issuer: acme
   sealed-<app>-oidc.yaml  # app-bound secrets only (see app-native-oidc)
@@ -110,6 +111,74 @@ There is **no `kubectl`, no `KUBECONFIG`, no `id-token: write`** anywhere — th
 production deploy never authenticates to the cluster. PR previews are pull-based
 too: Argo CD's PullRequest generator deploys each open PR and prunes it on close
 (`patterns/app-preview-prs/`), so CI never talks to the cluster at all.
+
+The push above needs no credential of its own: `permissions: packages: write`
+gives the workflow's built-in `GITHUB_TOKEN` push rights to the packages of its
+own repository, and the token dies with the job. Do **not** add a PAT to CI for
+this — the only PAT in this stack is the cluster's read-only pull credential
+(below).
+
+Add the OCI source label to the `Dockerfile` so GHCR links the package to this
+repository — that link is what gives the repo's `GITHUB_TOKEN` push access to
+the package on later runs, and what makes repo admins package admins:
+
+```dockerfile
+LABEL org.opencontainers.image.source=https://github.com/<owner>/<app>
+```
+
+## The package stays private
+
+GHCR creates a new package **private**, and for the apps of this stack it stays
+that way. This is not a default worth revisiting — it is the decision.
+
+**The trap that makes it load-bearing: your image contains your content.** A
+static-site generator (Astro, Hugo, Eleventy, Next.js export) reads
+`src/content/` at **build** time and bakes the rendered result into the image
+layers. "It's only code in there" is wrong, and it is wrong in the one direction
+that matters: a public package hands out every members-only page, every internal
+document, every name and address in that content directory — to anyone, with a
+plain `docker pull`, without touching your cluster, without a login, without a
+log line you will ever see. The whole login in front of the site is then
+decoration. The same holds for any image built with data in the build context:
+seed databases, fixtures, exported PDFs.
+
+So: an app whose site is protected by login MUST have a private package. Making
+it public to "fix" a pull error is a data leak, not a workaround. Fix the pull
+credential instead.
+
+**Verify the visibility — after the first push, and again after any package
+settings change:**
+
+```bash
+gh api /user/packages/container/<app> --jq .visibility          # user-owned
+gh api /orgs/<owner>/packages/container/<app> --jq .visibility  # org-owned
+# → "private"
+```
+
+(URL-encode a `/` in the package name as `%2F`.)
+
+## How the cluster pulls it
+
+A private package needs a registry credential in every namespace that runs the
+image. The prescribed credential is a **classic PAT scoped to `read:packages`
+only**, installed as the `imagePullSecret` `ghcr-pull` — created with `kubectl`,
+never committed, not even sealed (inv. 3). Full recipe, verify step, renewal
+duty and why neither the GitHub App nor a fine-grained PAT can do this job:
+**`runbooks/bootstrap-from-zero.md` §7**.
+
+What belongs in *this* repo is only the reference to it:
+
+```yaml
+# deploy/overlays/production/deployment.yaml
+spec:
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+```
+
+Without that block the Pod pulls anonymously and hangs in `ImagePullBackOff`,
+no matter how correct the secret in the namespace is.
 
 ## Database migrations (single-replica apps)
 

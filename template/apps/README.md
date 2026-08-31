@@ -42,7 +42,13 @@ deployed once).
   push access, it gets the `preview-deployer` role in its namespace only —
   never `cluster-admin`.
 - Images must be built for the server architecture (multi-arch builds).
+- An app whose image is **private** (every app that bakes protected content
+  into its build — see `patterns/app-deploy-ci/`) needs the `ghcr-pull`
+  `imagePullSecret` in its namespace and an `imagePullSecrets:` block in its
+  Deployment: `runbooks/bootstrap-from-zero.md` §7. Never make a package public
+  to make a pull work.
 - Only **app/service secrets** enter this repo, and only as SealedSecrets.
   **Infrastructure credentials** (Argo CD GitHub App key, ZITADEL operator
-  credential) live only in the cluster — never committed, not even sealed
-  (AGENTS.md inv. 3; `runbooks/argocd-github-app.md`).
+  credential, the registry pull credential) live only in the cluster — never
+  committed, not even sealed (AGENTS.md inv. 3;
+  `runbooks/argocd-github-app.md`).

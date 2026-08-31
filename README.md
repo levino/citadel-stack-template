@@ -319,7 +319,11 @@ These apply to every instance and every agent that touches the stack:
   discipline.
 - **GitOps is the single source of truth.** No manual `kubectl apply` outside
   documented bootstrap steps.
-- **Secrets only as sealed-secrets in git.** Never commit plaintext secrets.
+- **Two classes of secret, two homes.** *App* secrets enter git as
+  sealed-secrets; *infrastructure* credentials (Argo CD's git auth, the ZITADEL
+  operator credential, the registry pull credential for private images) live
+  only in the cluster — never committed, not even sealed. Never commit
+  plaintext.
 - **No vendor default credential survives its bootstrap** — and the obligation
   is to *enumerate the accounts that exist*, not to assume you know them. An
   omitted configuration value does not produce nothing; it produces the

@@ -70,7 +70,7 @@ kubectl get node   # one node, STATUS Ready
 ```
 
 To operate remotely, add a `tls-san` for your API domain in
-`/etc/rancher/k3s/config.yaml` and open 6443 in the §1.2 guard (see §7); for a
+`/etc/rancher/k3s/config.yaml` and open 6443 in the §1.2 guard (see §8); for a
 first bootstrap, running directly on the server is fine.
 
 ### 1.2 Host firewall
@@ -134,7 +134,7 @@ table inet k3sguard {
         # Operating kubectl from your laptop instead of the server? Add an
         # accept for your admin IP ABOVE the drop, e.g.
         #   ip saddr <your-admin-ip> tcp dport 6443 accept
-        # For the optional CI-OIDC case, open 6443 as described in §7.
+        # For the optional CI-OIDC case, open 6443 as described in §8.
         tcp dport { 6443, 10248, 10249, 10250, 10256, 10257, 10258, 10259 } drop
         udp dport 8472 drop
     }
@@ -767,7 +767,228 @@ curl -s -o /dev/null -w '%{redirect_url}\n' \
 # → https://id.{{ domain }}/...
 ```
 
-## 7. (Optional) CI deploys via GitHub Actions OIDC
+## 7. Private container images — the registry pull credential
+
+Apps this community builds itself ship as **private** GHCR packages, and a
+private package does not pull itself: every namespace that runs such an image
+needs a registry credential. Do this section before the first own app goes
+live; skip it only while every image in the cluster is public.
+
+> **Never "fix" a failing pull by making the package public.** A container
+> image is not just code. A static-site build (Astro, Hugo, Eleventy) compiles
+> `src/content/` **into the image**, so a public package hands out exactly the
+> member data the login was there to protect — no cluster involved, no log
+> entry, `docker pull` is enough. Details and the visibility check:
+> `patterns/app-deploy-ci/README.md`, "The package stays private".
+
+**The decision:** one **classic PAT whose only scope is `read:packages`**,
+installed as the `imagePullSecret` `ghcr-pull` in each app namespace. Not a
+GitHub App, not a fine-grained PAT — both are dead ends on GHCR; read "Why not
+the GitHub App" and "Why not a fine-grained PAT" at the end of this section
+before you try to improve this.
+
+A pull credential is an **infrastructure credential**: created directly with
+`kubectl`, **never committed, not even sealed** (`AGENTS.md` inv. 3). Invariant
+4's "never a PAT" governs **Argo CD's git authentication** — git auth and
+registry auth are different problems with different answers, and this is the
+answer for registry auth.
+
+### 7.1 Mint the token
+
+GitHub → Settings → Developer settings → **Personal access tokens (classic)** →
+Generate new token:
+
+- **Scope: `read:packages`, and nothing else.** Not `write:packages`, not
+  `repo`. The cluster only ever pulls; CI pushes with its own `GITHUB_TOKEN`
+  (`patterns/app-deploy-ci/`).
+- **Expiration: a real date, at most one year.** "No expiration" is forbidden
+  here — an immortal credential is one nobody ever reviews.
+- The token belongs to a **person**. Write down which account and which expiry
+  date; §7.3 records both in the cluster and you need them at renewal.
+
+Keep the token itself in the operator's password manager, next to the Argo CD
+GitHub App key (`runbooks/argocd-github-app.md`).
+
+### 7.2 Prove the token before it goes near the cluster
+
+A wrong registry credential does not fail loudly — `docker login ghcr.io`
+succeeds with almost any input and only the pull says `denied`. Ask the
+registry directly instead (needs `jq` on the machine you run this from):
+
+```bash
+read -rs GHCR_PAT           # paste the token: no echo, no shell history
+GH_USER=<github-login-that-owns-the-token>
+PKG={{ github_owner }}/<app>          # owner/package, lowercase
+
+TOKEN=$(curl -sS -u "$GH_USER:$GHCR_PAT" \
+  "https://ghcr.io/token?service=ghcr.io&scope=repository:$PKG:pull" \
+  | jq -r '.token // empty')
+[ -n "$TOKEN" ] || echo "FAIL: ghcr.io rejected the credentials outright"
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/$PKG/tags/list"
+```
+
+- `200` — the token may pull this package. Continue.
+- `401` — token wrong, expired, or missing `read:packages`.
+- `403` — token valid, but this account has no access to that package.
+
+Do not continue on anything but `200`. A bad credential in the cluster surfaces
+much later, as `ImagePullBackOff` in the middle of a rollout.
+
+### 7.3 Install it in the app namespace
+
+```bash
+APP=<app>          # the namespace scripts/new-app.sh created
+
+kubectl create secret docker-registry ghcr-pull -n "$APP" \
+  --docker-server=ghcr.io \
+  --docker-username="$GH_USER" \
+  --docker-password="$GHCR_PAT"
+
+# Mandatory: the credential must say who owns it and when it dies.
+kubectl annotate secret ghcr-pull -n "$APP" \
+  owner="<person or role responsible>" \
+  expires="<YYYY-MM-DD from §7.1>"
+```
+
+Repeat for every app namespace — one namespace per app (`apps/README.md`), so
+one `ghcr-pull` per app; the same token every time, it is one credential
+copied. An app with PR previews is the exception — §7.6. When you are done:
+
+```bash
+unset GHCR_PAT
+```
+
+### 7.4 Reference it from the Deployment
+
+The secret is not used unless the Pod asks for it. In the app repo's
+`deploy/overlays/production/deployment.yaml` (`patterns/app-deploy-ci/`):
+
+```yaml
+spec:
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: app
+          image: ghcr.io/{{ github_owner }}/<app>
+```
+
+These lines are safe in git — they name a secret, they do not contain one.
+
+### 7.5 Verify — with a real pull
+
+Do not trust "the secret exists". Pull the image:
+
+```bash
+kubectl -n "$APP" run ghcr-pullcheck --restart=Never \
+  --image=ghcr.io/{{ github_owner }}/<app>:latest \
+  --overrides='{"spec":{"imagePullSecrets":[{"name":"ghcr-pull"}]}}'
+sleep 20
+kubectl -n "$APP" get pod ghcr-pullcheck \
+  -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}{"\n"}'
+kubectl -n "$APP" delete pod ghcr-pullcheck --now
+```
+
+Empty output, `CrashLoopBackOff` or `ContainerCreating` all mean **the image
+came down** — the credential works; whether the container then runs is not this
+test's business. `ErrImagePull` or `ImagePullBackOff` mean the credential was
+rejected: `kubectl -n "$APP" describe pod ghcr-pullcheck` carries the
+registry's own message before you delete it.
+
+Credential inventory across the cluster:
+
+```bash
+kubectl get secret -A --field-selector type=kubernetes.io/dockerconfigjson \
+  -o custom-columns=NS:.metadata.namespace,SECRET:.metadata.name,\
+OWNER:.metadata.annotations.owner,EXPIRES:.metadata.annotations.expires
+# every row must name an owner and a date — `<none>` is a defect, fix it now
+```
+
+### 7.6 PR previews — the credential moves to the node
+
+A preview namespace (`<app>-pr-<n>`) is created by Argo CD the moment a PR
+opens, so no hand-made secret can be in it in time. For an app that has both
+PR previews (`patterns/app-preview-prs/`) and a private image, the same token
+goes into the node's containerd config instead, where it covers every
+namespace on this node — including ones that do not exist yet:
+
+```yaml
+# /etc/rancher/k3s/registries.yaml   (on the server, root-owned, mode 0600)
+configs:
+  ghcr.io:
+    auth:
+      username: <github-login>
+      password: <the read:packages PAT>
+```
+
+```bash
+sudo chmod 600 /etc/rancher/k3s/registries.yaml
+sudo systemctl restart k3s        # containerd reads this file only at start
+```
+
+That covers the app's production namespace too, so such an app needs no
+per-namespace `ghcr-pull` — §7.3 stays the rule for apps without previews.
+This is a node-wide credential: every workload on the node can then pull every
+private package the token can reach. On a single node with one operator that
+is an accepted trade-off (inv. 8); it would not be on a shared cluster.
+
+### 7.7 Renewal — the price of this decision
+
+The honest downside of a PAT: it hangs on a personal account and it **expires**.
+Nothing in the cluster warns you; pulls simply start failing, and only for Pods
+that restart, so the failure looks random. Therefore:
+
+- The `owner` / `expires` annotations from §7.3 are not decoration. Check them
+  whenever you touch the cluster (the inventory command in §7.5 is in
+  `AGENTS.md`'s verify block for that reason).
+- Renew **before** the date: mint a new token (§7.1), re-run §7.2, then
+  `kubectl delete secret ghcr-pull -n <app>` and recreate it (§7.3) with a new
+  `expires`. Re-verify with §7.5. Revoke the old token afterwards.
+- When the owning person leaves, the credential leaves with them. Reissue it on
+  another account the same day — this is the one credential in this stack with
+  a human single point of failure.
+- **Rebuild note:** like every infrastructure credential this is not
+  reproducible from git (inv. 3). After a cluster rebuild, redo §7.3 for every
+  app namespace from the token in the password manager.
+
+### Why not the GitHub App
+
+The instinctive move is to reuse the Argo CD GitHub App — one credential for
+git *and* registry. It does not work, for two independent reasons:
+
+1. **An installation token lives one hour.** An `imagePullSecret` is a static
+   `dockerconfigjson` blob; kubelet re-reads it but nothing refreshes it. You
+   would need a CronJob that every ~45 minutes signs a JWT with the App's
+   private key, exchanges it for an installation token and rewrites the secret
+   in every app namespace. That is a moving part on a single-node cluster whose
+   failure mode is silent: it dies, nothing changes for an hour, and then the
+   next Pod that restarts cannot pull. Nobody connects the two.
+2. **GHCR does not accept App installation tokens at all** — `docker login`
+   appears to succeed and the pull answers `denied`. GitHub has confirmed this
+   as a platform limitation.
+
+So the App would be a scheduled token-refresh machine bolted onto a registry
+that rejects its tokens anyway. Do not build it.
+
+### Why not a fine-grained PAT
+
+Fine-grained PATs are the better credential in every other respect — scoped to
+one owner, one permission, revocable — so this looks like an obvious upgrade.
+**GitHub Packages does not support them.** There is no `Packages` permission in
+the fine-grained permission set; GitHub's own docs list "using fine-grained
+personal access token to access Packages" under the known feature gaps and
+state that "GitHub Packages only supports authentication using a personal access
+token (classic)". Tracking issue: `github/roadmap#558`, open since 2022.
+
+The failure mode is the trap: the token *is* accepted by `docker login`, and
+only the pull answers `denied`. If you find yourself debugging a mysterious
+`ImagePullBackOff`, check the token type first. When the roadmap issue closes,
+switching is a one-line change in §7.1 — until then, classic with a single
+scope is as small as this credential gets.
+
+## 8. (Optional) CI deploys via GitHub Actions OIDC
 
 With Argo CD, deployments are **pull-based**: production rollouts and PR
 previews are reconciled by Argo CD from git (`patterns/app-preview-prs/`), so an
@@ -832,7 +1053,7 @@ to cluster-admin (invariant) — the policy in `cluster/policy/` denies it anywa
 **Verify:** a `kubectl --token=<github-oidc-token>` from a workflow can
 deploy into its app namespace and nothing else.
 
-## 8. Done — handover to normal operation
+## 9. Done — handover to normal operation
 
 ```bash
 kubectl -n argocd get applications    # everything Synced/Healthy
